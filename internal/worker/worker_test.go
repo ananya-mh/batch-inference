@@ -1,0 +1,451 @@
+// End-to-end tests: real River workers, the real scheduler, and a fake model
+// server. They cover a batch running to completion, retries of cut-off
+// replies, permanent failures, crash recovery (guarantee 1), and the same
+// request running twice (guarantee 2).
+package worker_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
+
+	"github.com/ananya-mh/batch-inference/internal/batches"
+	"github.com/ananya-mh/batch-inference/internal/fakemodel"
+	"github.com/ananya-mh/batch-inference/internal/model"
+	"github.com/ananya-mh/batch-inference/internal/requests"
+	"github.com/ananya-mh/batch-inference/internal/scheduler"
+	"github.com/ananya-mh/batch-inference/internal/testdb"
+	"github.com/ananya-mh/batch-inference/internal/testfixtures"
+	"github.com/ananya-mh/batch-inference/internal/worker"
+)
+
+// testWorkerConfig returns quick settings for tests.
+func testWorkerConfig() worker.Config {
+	return worker.Config{
+		Workers:              4,
+		MaxAttempts:          3,
+		JobTimeout:           5 * time.Second,
+		RescueStuckJobsAfter: 10 * time.Second,
+		RetryBaseDelay:       10 * time.Millisecond,
+	}
+}
+
+// system is a running scheduler plus River workers for one test.
+type system struct {
+	pool      *pgxpool.Pool
+	river     *river.Client[pgx.Tx]
+	scheduler *scheduler.Scheduler
+}
+
+// newSystem builds the scheduler and River client against the model at
+// modelURL. Neither is started; call start.
+func newSystem(t *testing.T, pool *pgxpool.Pool, modelURL string, config worker.Config) *system {
+	t.Helper()
+	sys := &system{pool: pool}
+	riverClient, err := worker.NewRiverClient(pool, model.NewClient(modelURL, ""), config, func() { sys.scheduler.Nudge() })
+	if err != nil {
+		t.Fatalf("NewRiverClient: %v", err)
+	}
+	sys.river = riverClient
+	sys.scheduler = scheduler.New(pool, riverClient, scheduler.Config{Window: 8, PassInterval: 20 * time.Millisecond})
+	return sys
+}
+
+// start starts the workers and the scheduler loop, and stops both when the
+// test ends.
+func (sys *system) start(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := sys.river.Start(ctx); err != nil {
+		t.Fatalf("start river: %v", err)
+	}
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		sys.scheduler.Run(ctx)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		<-schedulerDone
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		if err := sys.river.Stop(stopCtx); err != nil {
+			t.Errorf("stop river: %v", err)
+		}
+	})
+}
+
+// startFakeModel runs the fake model with config and returns its /v1 URL.
+func startFakeModel(t *testing.T, config fakemodel.Config) string {
+	t.Helper()
+	server, err := fakemodel.NewServer(config)
+	if err != nil {
+		t.Fatalf("fakemodel.NewServer: %v", err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+	return httpServer.URL + "/v1"
+}
+
+// waitForStatus polls until the batch reaches want, failing after timeout.
+func waitForStatus(t *testing.T, pool *pgxpool.Pool, batchID string, want batches.Status, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if testfixtures.BatchStatus(t, pool, batchID) == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("batch %s is %s after %s, want %s; requests: %v",
+		batchID, testfixtures.BatchStatus(t, pool, batchID), timeout, want, testfixtures.CountRequests(t, pool, batchID))
+}
+
+// result is one row of the results table.
+type result struct {
+	CustomID     string
+	Succeeded    bool
+	Response     []byte
+	ErrorCode    *string
+	ErrorMessage *string
+}
+
+// describeError returns a result's error code and message for test output.
+func describeError(r result) string {
+	if r.ErrorCode == nil || r.ErrorMessage == nil {
+		return "(none)"
+	}
+	return *r.ErrorCode + ": " + *r.ErrorMessage
+}
+
+// readResults returns the batch's results.
+func readResults(t *testing.T, pool *pgxpool.Pool, batchID string) []result {
+	t.Helper()
+	rows, err := pool.Query(context.Background(),
+		"SELECT custom_id, succeeded, response, error_code, error_message FROM results WHERE batch_id = $1 ORDER BY custom_id", batchID)
+	if err != nil {
+		t.Fatalf("query results: %v", err)
+	}
+	results, err := pgx.CollectRows(rows, pgx.RowToStructByPos[result])
+	if err != nil {
+		t.Fatalf("read results: %v", err)
+	}
+	return results
+}
+
+// jobAttempts returns the attempt count of each of the batch's River jobs.
+func jobAttempts(t *testing.T, pool *pgxpool.Pool, batchID string) []int {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), "SELECT attempt FROM river_job WHERE args->>'batch_id' = $1", batchID)
+	if err != nil {
+		t.Fatalf("query attempts: %v", err)
+	}
+	attempts, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if err != nil {
+		t.Fatalf("read attempts: %v", err)
+	}
+	return attempts
+}
+
+// TestBatchRunsEndToEnd checks a batch goes from validating to completed with
+// one successful result per line, and the right progress counts.
+func TestBatchRunsEndToEnd(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	modelURL := startFakeModel(t, fakemodel.Config{MaxDelay: 20 * time.Millisecond, OutputWords: 5})
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 30)
+	newSystem(t, pool, modelURL, testWorkerConfig()).start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	results := readResults(t, pool, batch.ID)
+	if len(results) != 30 {
+		t.Fatalf("%d results, want 30", len(results))
+	}
+	for _, r := range results {
+		if !r.Succeeded || !json.Valid(r.Response) {
+			t.Errorf("result %s: succeeded %v, response %s, error %s", r.CustomID, r.Succeeded, r.Response, describeError(r))
+		}
+	}
+	got, err := batches.Get(context.Background(), pool, "tenant_a", batch.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.RequestCounts != (batches.RequestCounts{Total: 30, Completed: 30}) {
+		t.Errorf("request counts = %+v, want 30 total, 30 completed", got.RequestCounts)
+	}
+	if got.InProgressAt == nil || got.FinalizingAt == nil || got.CompletedAt == nil {
+		t.Errorf("missing status times: %+v", got)
+	}
+}
+
+// crashFirstAttemptModel is a model server that, for each distinct request
+// body, cuts off the first reply halfway (200 status, half the body, then a
+// dropped connection), and answers later attempts normally.
+func crashFirstAttemptModel(t *testing.T) (url string, calls *atomic.Int64) {
+	t.Helper()
+	crashing, err := fakemodel.NewServer(fakemodel.Config{OutputWords: 5, CrashRate: 1})
+	if err != nil {
+		t.Fatalf("fakemodel.NewServer: %v", err)
+	}
+	healthy, err := fakemodel.NewServer(fakemodel.Config{OutputWords: 5})
+	if err != nil {
+		t.Fatalf("fakemodel.NewServer: %v", err)
+	}
+
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	calls = &atomic.Int64{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		mu.Lock()
+		first := !seen[string(body)]
+		seen[string(body)] = true
+		mu.Unlock()
+
+		// The body was read above, so hand the fake model a fresh copy.
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if first {
+			crashing.Handler().ServeHTTP(w, r)
+			return
+		}
+		healthy.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/v1", calls
+}
+
+// TestCutOffReplyIsRetriedNeverSaved checks a 200 reply with a cut-off body
+// counts as a failed attempt: the request is retried, and only the later,
+// complete reply is saved.
+func TestCutOffReplyIsRetriedNeverSaved(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	modelURL, calls := crashFirstAttemptModel(t)
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 5)
+	newSystem(t, pool, modelURL, testWorkerConfig()).start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	results := readResults(t, pool, batch.ID)
+	if len(results) != 5 {
+		t.Fatalf("%d results, want 5", len(results))
+	}
+	for _, r := range results {
+		var reply struct {
+			Choices []json.RawMessage `json:"choices"`
+		}
+		if !r.Succeeded || json.Unmarshal(r.Response, &reply) != nil || len(reply.Choices) != 1 {
+			t.Errorf("result %s is not a complete reply: succeeded %v, response %s", r.CustomID, r.Succeeded, r.Response)
+		}
+	}
+	for _, attempts := range jobAttempts(t, pool, batch.ID) {
+		if attempts != 2 {
+			t.Errorf("a job took %d attempts, want 2 (cut off, then complete)", attempts)
+		}
+	}
+	if calls.Load() != 10 {
+		t.Errorf("model was called %d times, want 10 (two per request)", calls.Load())
+	}
+}
+
+// TestAlwaysCutOffReplyFailsAfterMaxAttempts checks a request whose replies
+// are always cut off fails after the last attempt, with a reason, and nothing
+// partial is saved as a success.
+func TestAlwaysCutOffReplyFailsAfterMaxAttempts(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	modelURL := startFakeModel(t, fakemodel.Config{OutputWords: 5, CrashRate: 1})
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 3)
+	newSystem(t, pool, modelURL, testWorkerConfig()).start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	for _, r := range readResults(t, pool, batch.ID) {
+		if r.Succeeded || r.Response != nil || r.ErrorCode == nil || *r.ErrorCode != "retries_exhausted" {
+			t.Errorf("result %s: succeeded %v, response %s, error code %v; want retries_exhausted and no response",
+				r.CustomID, r.Succeeded, r.Response, r.ErrorCode)
+		}
+	}
+	for _, attempts := range jobAttempts(t, pool, batch.ID) {
+		if attempts != 3 {
+			t.Errorf("a job took %d attempts, want 3 (MaxAttempts)", attempts)
+		}
+	}
+	got, err := batches.Get(context.Background(), pool, "tenant_a", batch.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.RequestCounts != (batches.RequestCounts{Total: 3, Failed: 3}) {
+		t.Errorf("request counts = %+v, want 3 failed", got.RequestCounts)
+	}
+}
+
+// TestRejectedRequestFailsWithoutRetry checks a 400 from the model fails the
+// request on the first attempt, since retrying cannot help.
+func TestRejectedRequestFailsWithoutRetry(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error": {"message": "unknown model"}}`, http.StatusBadRequest)
+	}))
+	t.Cleanup(server.Close)
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 2)
+	newSystem(t, pool, server.URL+"/v1", testWorkerConfig()).start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	for _, r := range readResults(t, pool, batch.ID) {
+		if r.Succeeded || r.ErrorCode == nil || *r.ErrorCode != "model_rejected" {
+			t.Errorf("result %s: succeeded %v, error code %v; want model_rejected", r.CustomID, r.Succeeded, r.ErrorCode)
+		}
+	}
+	for _, attempts := range jobAttempts(t, pool, batch.ID) {
+		if attempts != 1 {
+			t.Errorf("a job took %d attempts, want 1", attempts)
+		}
+	}
+}
+
+// queueOneRequest creates a one-line batch and runs one scheduler pass, so
+// its request is queued with a River job, while no worker is running yet.
+func queueOneRequest(t *testing.T, sys *system) batches.Batch {
+	t.Helper()
+	batch := testfixtures.CreateBatch(t, sys.pool, "tenant_a", "a", 1)
+	if result, err := sys.scheduler.RunPass(context.Background()); err != nil || result.Admitted != 1 {
+		t.Fatalf("RunPass = %+v, %v; want 1 admitted", result, err)
+	}
+	return batch
+}
+
+// TestRetryAfterCrashedAttemptFinishes checks our side of crash recovery
+// (guarantee 1): a crashed attempt leaves the request running and its job
+// up for retry (what River's rescuer does), and the retry still finishes it.
+func TestRetryAfterCrashedAttemptFinishes(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	sys := newSystem(t, pool, startFakeModel(t, fakemodel.Config{OutputWords: 5}), testWorkerConfig())
+	batch := queueOneRequest(t, sys)
+
+	// The state a worker that died mid-request leaves behind, after River's
+	// rescuer has made its job available again.
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, "UPDATE requests SET status = 'running', started_at = now()"); err != nil {
+		t.Fatalf("simulate crashed attempt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE river_job SET attempt = 1, attempted_at = now(), state = 'available'"); err != nil {
+		t.Fatalf("simulate rescued job: %v", err)
+	}
+	sys.start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+	if results := readResults(t, pool, batch.ID); len(results) != 1 || !results[0].Succeeded {
+		t.Errorf("results = %+v, want one success", results)
+	}
+}
+
+// TestStuckJobIsRescuedByRiver checks crash recovery end to end with River's
+// real rescuer (guarantee 1): a job left "running" by a worker that died is
+// found, run again, and the request finishes. River's rescuer runs when a
+// client becomes leader and then every 30 seconds, so here it acts at start.
+func TestStuckJobIsRescuedByRiver(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	config := testWorkerConfig()
+	config.JobTimeout = time.Second
+	config.RescueStuckJobsAfter = 2 * time.Second
+	sys := newSystem(t, pool, startFakeModel(t, fakemodel.Config{OutputWords: 5}), config)
+	batch := queueOneRequest(t, sys)
+
+	// Exactly what a worker process killed mid-request leaves: the job
+	// running, attempted by a client that no longer exists, a while ago.
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, "UPDATE requests SET status = 'running', started_at = now()"); err != nil {
+		t.Fatalf("simulate crashed attempt: %v", err)
+	}
+	_, err := pool.Exec(ctx, `
+		UPDATE river_job
+		SET state = 'running', attempt = 1, attempted_at = now() - interval '1 minute',
+		    attempted_by = ARRAY['worker-that-died']`)
+	if err != nil {
+		t.Fatalf("simulate stuck job: %v", err)
+	}
+	sys.start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 90*time.Second)
+	if results := readResults(t, pool, batch.ID); len(results) != 1 || !results[0].Succeeded {
+		t.Errorf("results = %+v, want one success", results)
+	}
+
+	// Make sure it really was River's rescuer that freed the job: the job
+	// ran a second attempt, and River recorded the rescue as its error.
+	var attempt int
+	var jobErrors string
+	err = pool.QueryRow(ctx, "SELECT attempt, coalesce(errors::text, '') FROM river_job").Scan(&attempt, &jobErrors)
+	if err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if attempt != 2 || !strings.Contains(strings.ToLower(jobErrors), "rescue") {
+		t.Errorf("job attempt = %d, errors = %q; want attempt 2 with a rescue recorded", attempt, jobErrors)
+	}
+}
+
+// TestSameRequestRunTwiceSavesOneResult runs two jobs for the same request at
+// the same time, as happens when a slow worker is rescued while still alive.
+// Both call the model, but only one result is saved (guarantee 2).
+func TestSameRequestRunTwiceSavesOneResult(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	var calls atomic.Int64
+	slowModel, err := fakemodel.NewServer(fakemodel.Config{MinDelay: 300 * time.Millisecond, MaxDelay: 300 * time.Millisecond, OutputWords: 5})
+	if err != nil {
+		t.Fatalf("fakemodel.NewServer: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		slowModel.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	sys := newSystem(t, pool, server.URL+"/v1", testWorkerConfig())
+	batch := queueOneRequest(t, sys)
+	// A second job for the same request.
+	if _, err := sys.river.Insert(context.Background(), requests.RunArgs{BatchID: batch.ID, CustomID: "a-0"}, nil); err != nil {
+		t.Fatalf("insert duplicate job: %v", err)
+	}
+	sys.start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	if calls.Load() != 2 {
+		t.Fatalf("model was called %d times, want 2 (both jobs ran)", calls.Load())
+	}
+	if results := readResults(t, pool, batch.ID); len(results) != 1 {
+		t.Errorf("%d results saved, want exactly 1", len(results))
+	}
+	var unfinishedJobs int
+	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM river_job WHERE state <> 'completed'").Scan(&unfinishedJobs); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if unfinishedJobs != 0 {
+		t.Errorf("%d jobs did not complete, want both completed", unfinishedJobs)
+	}
+}

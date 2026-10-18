@@ -77,16 +77,28 @@ type NewBatch struct {
 	RequestTotal     int
 }
 
-// batchColumns is the column list every query reads, in the order scanBatch
-// expects.
-const batchColumns = `
-	id, tenant_id, input_file_id, endpoint, completion_window, status,
-	output_file_id, error_file_id, metadata,
-	request_total, request_completed, request_failed,
-	created_at, expires_at, in_progress_at, finalizing_at, completed_at,
-	failed_at, expired_at, cancelling_at, cancelled_at`
+// selectBatches is the start of every query that reads batches, giving the
+// columns in the order scanBatch expects. Queries add their own WHERE.
+//
+// Completed and failed counts are counted from the requests table rather
+// than kept as counters on the batch row, so workers never all update one
+// row, and the counts can never drift from the truth. The requests index on
+// (batch_id, status) makes this a quick index-only count.
+const selectBatches = `
+	SELECT b.id, b.tenant_id, b.input_file_id, b.endpoint, b.completion_window, b.status,
+		b.output_file_id, b.error_file_id, b.metadata,
+		b.request_total, counts.completed, counts.failed,
+		b.created_at, b.expires_at, b.in_progress_at, b.finalizing_at, b.completed_at,
+		b.failed_at, b.expired_at, b.cancelling_at, b.cancelled_at
+	FROM batches b
+	CROSS JOIN LATERAL (
+		SELECT count(*) FILTER (WHERE r.status = 'succeeded') AS completed,
+		       count(*) FILTER (WHERE r.status = 'failed') AS failed
+		FROM requests r
+		WHERE r.batch_id = b.id
+	) counts`
 
-// scanBatch reads one row of batchColumns into a Batch.
+// scanBatch reads one row of selectBatches into a Batch.
 func scanBatch(row pgx.Row) (Batch, error) {
 	var batch Batch
 	err := row.Scan(
@@ -103,27 +115,26 @@ func scanBatch(row pgx.Row) (Batch, error) {
 func Create(ctx context.Context, db DB, newBatch NewBatch) (Batch, error) {
 	// The expiry time is worked out by the database from its own clock,
 	// the same clock the expiry check will later compare against.
-	row := db.QueryRow(ctx, `
+	batchID := newBatchID()
+	_, err := db.Exec(ctx, `
 		INSERT INTO batches (
 			id, tenant_id, input_file_id, endpoint, completion_window, status,
 			metadata, request_total, expires_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + make_interval(secs => $9))
-		RETURNING `+batchColumns,
-		newBatchID(), newBatch.TenantID, newBatch.InputFileID, newBatch.Endpoint, newBatch.CompletionWindow,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + make_interval(secs => $9))`,
+		batchID, newBatch.TenantID, newBatch.InputFileID, newBatch.Endpoint, newBatch.CompletionWindow,
 		StatusValidating, newBatch.Metadata, newBatch.RequestTotal, newBatch.WindowLength.Seconds(),
 	)
-	batch, err := scanBatch(row)
 	if err != nil {
 		return Batch{}, fmt.Errorf("insert batch: %w", err)
 	}
-	return batch, nil
+	return Get(ctx, db, newBatch.TenantID, batchID)
 }
 
 // Get returns a tenant's batch, or ErrNotFound.
 func Get(ctx context.Context, db DB, tenantID, batchID string) (Batch, error) {
 	row := db.QueryRow(ctx,
-		"SELECT "+batchColumns+" FROM batches WHERE id = $1 AND tenant_id = $2",
+		selectBatches+" WHERE b.id = $1 AND b.tenant_id = $2",
 		batchID, tenantID,
 	)
 	batch, err := scanBatch(row)
@@ -153,10 +164,9 @@ func List(ctx context.Context, db DB, tenantID string, limit int, afterID string
 	var rows pgx.Rows
 	var err error
 	if afterID == "" {
-		rows, err = db.Query(ctx, `
-			SELECT `+batchColumns+` FROM batches
-			WHERE tenant_id = $1
-			ORDER BY created_at DESC, id DESC
+		rows, err = db.Query(ctx, selectBatches+`
+			WHERE b.tenant_id = $1
+			ORDER BY b.created_at DESC, b.id DESC
 			LIMIT $2`,
 			tenantID, limit+1,
 		)
@@ -171,10 +181,9 @@ func List(ctx context.Context, db DB, tenantID string, limit int, afterID string
 		if err != nil {
 			return Page{}, fmt.Errorf("look up list cursor: %w", err)
 		}
-		rows, err = db.Query(ctx, `
-			SELECT `+batchColumns+` FROM batches
-			WHERE tenant_id = $1 AND (created_at, id) < ($2, $3)
-			ORDER BY created_at DESC, id DESC
+		rows, err = db.Query(ctx, selectBatches+`
+			WHERE b.tenant_id = $1 AND (b.created_at, b.id) < ($2, $3)
+			ORDER BY b.created_at DESC, b.id DESC
 			LIMIT $4`,
 			tenantID, cursorCreatedAt, afterID, limit+1,
 		)

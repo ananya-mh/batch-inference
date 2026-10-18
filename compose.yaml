@@ -34,12 +34,20 @@ services:
       COMPLETION_WINDOWS: "24h"
       # Development tenants and keys only. Real keys never go in this file.
       SEED_TENANTS: tenant_a=sk-dev-tenant-a,tenant_b=sk-dev-tenant-b,tenant_c=sk-dev-tenant-c,tenant_d=sk-dev-tenant-d
+      # Where requests are sent: the fake model here, vLLM for the GPU check.
+      MODEL_BASE_URL: http://fakemodel:8000/v1
+      WORKERS: "16"
+      SCHEDULER_WINDOW: "32"
+      MAX_ATTEMPTS: "5"
+      JOB_TIMEOUT: 2m
     ports:
       - "8080:8080"
     depends_on:
       # Wait until Postgres accepts connections, not just until it starts.
       postgres:
         condition: service_healthy
+      fakemodel:
+        condition: service_started
     restart: unless-stopped
 
   # Pretend AI model, so no GPU is needed. Tune its behavior with the
