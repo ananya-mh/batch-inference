@@ -20,6 +20,8 @@ services:
 
   server:
     build: .
+    # Both services share this image, so it is built only once.
+    image: batch-inference:dev
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/batch?sslmode=disable
       HTTP_ADDR: ":8080"
@@ -29,6 +31,21 @@ services:
       # Wait until Postgres accepts connections, not just until it starts.
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Pretend AI model, so no GPU is needed. Tune its behavior with the
+  # FAKE_MODEL_* variables (see internal/fakemodel/config.go).
+  fakemodel:
+    image: batch-inference:dev
+    entrypoint: ["/fakemodel"]
+    environment:
+      FAKE_MODEL_MIN_DELAY: 50ms
+      FAKE_MODEL_MAX_DELAY: 500ms
+      FAKE_MODEL_OUTPUT_WORDS: "20"
+      FAKE_MODEL_ERROR_RATE: "0.02"
+      FAKE_MODEL_CRASH_RATE: "0.01"
+    ports:
+      - "8000:8000"
     restart: unless-stopped
 
 volumes:
