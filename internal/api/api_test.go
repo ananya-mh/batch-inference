@@ -5,14 +5,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/ananya-mh/batch-inference/internal/testdb"
 )
 
+// testConfig returns API settings for tests: the default upload limit, and a
+// 24h window plus a 2s one for tests that need a batch to expire quickly.
+func testConfig() Config {
+	return Config{
+		MaxUploadBytes:    DefaultMaxUploadBytes,
+		CompletionWindows: map[string]time.Duration{"24h": 24 * time.Hour, "2s": 2 * time.Second},
+	}
+}
+
 // TestHealthReportsOKWhenDatabaseIsUp checks the happy path of /healthz.
 func TestHealthReportsOKWhenDatabaseIsUp(t *testing.T) {
 	t.Parallel()
-	server := NewServer(testdb.New(t), Config{MaxUploadBytes: DefaultMaxUploadBytes})
+	server := NewServer(testdb.New(t), testConfig())
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -27,7 +37,7 @@ func TestHealthReportsOKWhenDatabaseIsUp(t *testing.T) {
 func TestHealthReportsUnavailableWhenDatabaseIsDown(t *testing.T) {
 	t.Parallel()
 	pool := testdb.New(t)
-	server := NewServer(pool, Config{MaxUploadBytes: DefaultMaxUploadBytes})
+	server := NewServer(pool, testConfig())
 	// A closed pool behaves like a database that cannot be reached.
 	pool.Close()
 

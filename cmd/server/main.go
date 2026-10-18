@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ananya-mh/batch-inference/internal/api"
+	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/database"
 	"github.com/ananya-mh/batch-inference/internal/tenants"
 )
@@ -47,6 +48,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	completionWindows, err := readCompletionWindows()
+	if err != nil {
+		return err
+	}
 
 	pool, err := database.Connect(ctx, databaseURL)
 	if err != nil {
@@ -62,8 +67,11 @@ func run() error {
 	}
 
 	httpServer := &http.Server{
-		Addr:    httpAddr,
-		Handler: api.NewServer(pool, api.Config{MaxUploadBytes: maxUploadBytes}).Handler(),
+		Addr: httpAddr,
+		Handler: api.NewServer(pool, api.Config{
+			MaxUploadBytes:    maxUploadBytes,
+			CompletionWindows: completionWindows,
+		}).Handler(),
 		// Without timeouts, slow or stuck clients could hold connections
 		// open forever.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -103,6 +111,20 @@ func readMaxUploadBytes() (int64, error) {
 		return 0, fmt.Errorf("MAX_UPLOAD_BYTES must be a positive number of bytes, got %q", value)
 	}
 	return maxUploadBytes, nil
+}
+
+// readCompletionWindows reads COMPLETION_WINDOWS (like "24h,10s"), or
+// returns the default of "24h" only.
+func readCompletionWindows() (map[string]time.Duration, error) {
+	list := os.Getenv("COMPLETION_WINDOWS")
+	if list == "" {
+		list = batches.DefaultCompletionWindows
+	}
+	windows, err := batches.ParseCompletionWindows(list)
+	if err != nil {
+		return nil, fmt.Errorf("COMPLETION_WINDOWS: %w", err)
+	}
+	return windows, nil
 }
 
 // createSeedTenants creates the tenants listed in SEED_TENANTS

@@ -7,7 +7,6 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -25,48 +24,50 @@ const migrationLockID = 727_001
 
 // Migrate brings the database schema up to date. It is safe to call on every
 // startup and from several processes at once.
+//
+// Everything runs in one transaction on one connection. An earlier version
+// held the lock on one connection while asking the pool for a second one to
+// run River's migrations; with a small pool and several callers, the waiting
+// callers held every connection and it deadlocked (see "Bugs found" in
+// DESIGN.md).
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	// Hold one connection for the whole run: an advisory lock belongs to the
-	// connection that took it.
-	conn, err := pool.Acquire(ctx)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire connection for migrations: %w", err)
+		return fmt.Errorf("begin migrations: %w", err)
 	}
-	defer conn.Release()
+	defer RollbackUnlessCommitted(ctx, tx)
 
 	// If two servers start together, the second waits here until the first
-	// has finished, instead of both trying to create the same tables.
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockID); err != nil {
+	// has committed, instead of both trying to create the same tables. A
+	// transaction-level lock is released by commit or rollback on its own,
+	// so it can never be left held by mistake.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrationLockID); err != nil {
 		return fmt.Errorf("take migration lock: %w", err)
 	}
-	defer unlockMigrations(conn)
 
-	if err := migrateRiver(ctx, pool); err != nil {
+	if err := migrateRiver(ctx, pool, tx); err != nil {
 		return err
 	}
-	return migrateApp(ctx, conn.Conn())
-}
-
-// unlockMigrations releases the migration lock. It uses a fresh context so the
-// lock is still released when the caller's context has been cancelled.
-func unlockMigrations(conn *pgxpool.Conn) {
-	if _, err := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationLockID); err != nil {
-		// The connection is probably broken. Closing it makes Postgres drop
-		// the lock, rather than leaving it held on a pooled connection.
-		slog.Error("release migration lock", "error", err)
-		if err := conn.Hijack().Close(context.Background()); err != nil {
-			slog.Error("close connection holding migration lock", "error", err)
-		}
+	if err := migrateApp(ctx, tx); err != nil {
+		return err
 	}
+
+	// Committing applies every migration at once: a failure anywhere leaves
+	// the database as it was, and the next start simply tries again.
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migrations: %w", err)
+	}
+	return nil
 }
 
-// migrateRiver creates or updates the tables River needs for its job queue.
-func migrateRiver(ctx context.Context, pool *pgxpool.Pool) error {
+// migrateRiver creates or updates the tables River needs for its job queue,
+// inside tx.
+func migrateRiver(ctx context.Context, pool *pgxpool.Pool, tx pgx.Tx) error {
 	migrator, err := rivermigrate.New(riverpgxv5.New(pool), nil)
 	if err != nil {
 		return fmt.Errorf("create river migrator: %w", err)
 	}
-	if _, err := migrator.Migrate(ctx, rivermigrate.DirectionUp, nil); err != nil {
+	if _, err := migrator.MigrateTx(ctx, tx, rivermigrate.DirectionUp, nil); err != nil {
 		return fmt.Errorf("run river migrations: %w", err)
 	}
 	return nil
@@ -74,8 +75,8 @@ func migrateRiver(ctx context.Context, pool *pgxpool.Pool) error {
 
 // migrateApp runs each of our SQL migration files that has not run yet, in
 // file name order, and records it in the schema_migrations table.
-func migrateApp(ctx context.Context, conn *pgx.Conn) error {
-	_, err := conn.Exec(ctx, `
+func migrateApp(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -93,7 +94,7 @@ func migrateApp(ctx context.Context, conn *pgx.Conn) error {
 	sort.Strings(names)
 
 	for _, name := range names {
-		if err := applyMigration(ctx, conn, name); err != nil {
+		if err := applyMigration(ctx, tx, name); err != nil {
 			return err
 		}
 	}
@@ -101,9 +102,9 @@ func migrateApp(ctx context.Context, conn *pgx.Conn) error {
 }
 
 // applyMigration runs one migration file, unless it has already been applied.
-func applyMigration(ctx context.Context, conn *pgx.Conn, name string) error {
+func applyMigration(ctx context.Context, tx pgx.Tx, name string) error {
 	var alreadyApplied bool
-	err := conn.QueryRow(ctx,
+	err := tx.QueryRow(ctx,
 		"SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)", name,
 	).Scan(&alreadyApplied)
 	if err != nil {
@@ -117,15 +118,6 @@ func applyMigration(ctx context.Context, conn *pgx.Conn, name string) error {
 	if err != nil {
 		return fmt.Errorf("read migration %s: %w", name, err)
 	}
-
-	// Run the file and record it in one transaction, so a failed migration
-	// leaves no half-created tables behind and is retried on the next start.
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin migration %s: %w", name, err)
-	}
-	defer RollbackUnlessCommitted(ctx, tx)
-
 	// Exec with no arguments uses Postgres's simple protocol, which allows
 	// a file to contain several statements.
 	if _, err := tx.Exec(ctx, string(sql)); err != nil {
@@ -133,9 +125,6 @@ func applyMigration(ctx context.Context, conn *pgx.Conn, name string) error {
 	}
 	if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", name); err != nil {
 		return fmt.Errorf("record migration %s: %w", name, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit migration %s: %w", name, err)
 	}
 	return nil
 }

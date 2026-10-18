@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/ananya-mh/batch-inference/internal/tenants"
 	"github.com/ananya-mh/batch-inference/internal/testdb"
 )
@@ -33,13 +35,23 @@ func batchLine(customID string) string {
 // tenant_b, and the given upload limit.
 func newTestAPI(t *testing.T, maxUploadBytes int64) http.Handler {
 	t.Helper()
+	handler, _ := newTestAPIWithPool(t, maxUploadBytes)
+	return handler
+}
+
+// newTestAPIWithPool is newTestAPI, also returning the database pool for
+// tests that need to set up or inspect rows directly.
+func newTestAPIWithPool(t *testing.T, maxUploadBytes int64) (http.Handler, *pgxpool.Pool) {
+	t.Helper()
 	pool := testdb.New(t)
 	for tenantID, key := range map[string]string{"tenant_a": keyTenantA, "tenant_b": keyTenantB} {
 		if err := tenants.Create(context.Background(), pool, tenantID, key); err != nil {
 			t.Fatalf("create %s: %v", tenantID, err)
 		}
 	}
-	return NewServer(pool, Config{MaxUploadBytes: maxUploadBytes}).Handler()
+	config := testConfig()
+	config.MaxUploadBytes = maxUploadBytes
+	return NewServer(pool, config).Handler(), pool
 }
 
 // formField is one field of a multipart upload, in the order it is sent.

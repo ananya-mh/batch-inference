@@ -3,6 +3,9 @@
 services:
   postgres:
     image: postgres:17
+    # The default of 100 connections is too few when `go test ./...` runs
+    # many database tests at once, each with its own small pool.
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -26,6 +29,9 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/batch?sslmode=disable
       HTTP_ADDR: ":8080"
       MAX_UPLOAD_BYTES: "104857600" # 100 MB
+      # Completion windows clients may ask for. Add a short one like 30s to
+      # try expiry by hand.
+      COMPLETION_WINDOWS: "24h"
       # Development tenants and keys only. Real keys never go in this file.
       SEED_TENANTS: tenant_a=sk-dev-tenant-a,tenant_b=sk-dev-tenant-b,tenant_c=sk-dev-tenant-c,tenant_d=sk-dev-tenant-d
     ports:

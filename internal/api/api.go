@@ -4,6 +4,7 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -15,6 +16,10 @@ const DefaultMaxUploadBytes = 100 << 20
 type Config struct {
 	// MaxUploadBytes is the largest upload accepted, in bytes.
 	MaxUploadBytes int64
+
+	// CompletionWindows maps each completion window clients may ask for
+	// (like "24h") to its length.
+	CompletionWindows map[string]time.Duration
 }
 
 // Server holds what the HTTP handlers need to do their work.
@@ -37,6 +42,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/files", s.requireTenant(s.handleUploadFile))
 	mux.HandleFunc("GET /v1/files/{id}", s.requireTenant(s.handleGetFile))
 	mux.HandleFunc("GET /v1/files/{id}/content", s.requireTenant(s.handleGetFileContent))
+
+	mux.HandleFunc("POST /v1/batches", s.requireTenant(s.handleCreateBatch))
+	mux.HandleFunc("GET /v1/batches", s.requireTenant(s.handleListBatches))
+	mux.HandleFunc("GET /v1/batches/{id}", s.requireTenant(s.handleGetBatch))
 	return mux
 }
 

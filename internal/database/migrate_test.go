@@ -5,6 +5,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -64,6 +65,34 @@ func TestMigrateConcurrentlyIsSafe(t *testing.T) {
 	for err := range errs {
 		if err != nil {
 			t.Errorf("concurrent Migrate: %v", err)
+		}
+	}
+}
+
+// TestMigrateWorksWithOneConnection checks Migrate never needs more than one
+// connection at a time. An earlier version needed two, so on a small pool it
+// waited forever for a connection it was itself holding.
+func TestMigrateWorksWithOneConnection(t *testing.T) {
+	t.Parallel()
+	config := testdb.New(t).Config().Copy()
+	config.MaxConns = 1
+	onePool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("open one-connection pool: %v", err)
+	}
+	defer onePool.Close()
+
+	// A deadlock would hang forever; the timeout turns it into a failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	errs := make(chan error, 3)
+	for range 3 {
+		go func() { errs <- database.Migrate(ctx, onePool) }()
+	}
+	for range 3 {
+		if err := <-errs; err != nil {
+			t.Errorf("Migrate on a one-connection pool: %v", err)
 		}
 	}
 }

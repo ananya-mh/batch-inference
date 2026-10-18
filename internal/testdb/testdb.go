@@ -18,6 +18,12 @@ import (
 // defaultAdminURL matches the Postgres started by `docker compose up`.
 const defaultAdminURL = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
 
+// maxConnsPerTest caps each test's pool. pgx defaults to one connection per
+// CPU, and with many tests in many packages running at once that ran
+// Postgres out of connections ("too many clients"). Four is still enough for
+// tests to make truly concurrent database calls.
+const maxConnsPerTest = 4
+
 // New creates a fresh database for this test, runs all migrations on it, and
 // returns a pool connected to it. The database is dropped when the test ends.
 //
@@ -51,6 +57,7 @@ func New(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("parse test database URL: %v", err)
 	}
 	config.ConnConfig.Database = databaseName
+	config.MaxConns = maxConnsPerTest
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
