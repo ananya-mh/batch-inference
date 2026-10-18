@@ -44,6 +44,9 @@ services:
       FAKE_MODEL_OUTPUT_WORDS: "20"
       FAKE_MODEL_ERROR_RATE: "0.02"
       FAKE_MODEL_CRASH_RATE: "0.01"
+      # Set a seed for repeatable runs (the experiment does). Unset means
+      # truly random.
+      FAKE_MODEL_SEED: ${FAKE_MODEL_SEED:-}
     ports:
       - "8000:8000"
     restart: unless-stopped

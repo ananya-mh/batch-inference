@@ -6,12 +6,16 @@ package fakemodel
 
 import (
 	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +26,13 @@ const maxRequestBytes = 1 << 20
 // Server is the fake model's HTTP server.
 type Server struct {
 	config Config
+
+	// With a seed, timesSeen counts how often each request body (by hash)
+	// has arrived, so a retry of a failed request gets a fresh roll instead
+	// of failing the same way forever. mu guards it, since requests are
+	// handled concurrently.
+	mu        sync.Mutex
+	timesSeen map[[sha256.Size]byte]uint64
 }
 
 // NewServer returns a fake model server with the given settings.
@@ -29,7 +40,22 @@ func NewServer(config Config) (*Server, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	return &Server{config: config}, nil
+	return &Server{config: config, timesSeen: make(map[[sha256.Size]byte]uint64)}, nil
+}
+
+// outcome is what the fake model does with one request.
+type outcome int
+
+const (
+	outcomeSuccess outcome = iota
+	outcomeError
+	outcomeCrash
+)
+
+// plan is the delay and outcome chosen for one request.
+type plan struct {
+	delay   time.Duration
+	outcome outcome
 }
 
 // Handler returns an http.Handler with the fake model's routes.
@@ -85,9 +111,15 @@ type usage struct {
 // handleChatCompletion waits a random delay, then replies with filler text,
 // a simulated error, or a simulated crash, depending on the settings.
 func (s *Server) handleChatCompletion(w http.ResponseWriter, r *http.Request) {
+	// Read the raw body first: with a seed, the exact bytes decide what
+	// happens to this request.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "read request body: "+err.Error())
+		return
+	}
 	var request chatRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
-	if err := decoder.Decode(&request); err != nil {
+	if err := json.Unmarshal(body, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON: "+err.Error())
 		return
 	}
@@ -96,34 +128,75 @@ func (s *Server) handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	plan := s.planFor(body)
+
 	// Stop early if the caller gives up (for example, a worker that timed
 	// out or was shut down), just as a real server would stop generating.
 	select {
-	case <-time.After(s.randomDelay()):
+	case <-time.After(plan.delay):
 	case <-r.Context().Done():
 		return
 	}
 
-	// One roll decides the outcome: [0, crash) crashes, [crash,
-	// crash+error) fails, and the rest succeed.
-	roll := rand.Float64()
-	switch {
-	case roll < s.config.CrashRate:
+	switch plan.outcome {
+	case outcomeCrash:
 		s.crashMidResponse(w, request)
-	case roll < s.config.CrashRate+s.config.ErrorRate:
+	case outcomeError:
 		writeError(w, http.StatusInternalServerError, "server_error", "fake model: simulated server error")
-	default:
+	case outcomeSuccess:
 		writeJSON(w, http.StatusOK, s.buildReply(request))
 	}
 }
 
-// randomDelay picks a delay between MinDelay and MaxDelay.
-func (s *Server) randomDelay() time.Duration {
-	spread := s.config.MaxDelay - s.config.MinDelay
-	if spread == 0 {
-		return s.config.MinDelay
+// planFor picks the delay and outcome for a request with this body.
+func (s *Server) planFor(body []byte) plan {
+	random := s.randomSourceFor(body)
+
+	delay := s.config.MinDelay
+	if spread := s.config.MaxDelay - s.config.MinDelay; spread > 0 {
+		delay += time.Duration(random.Int64N(int64(spread) + 1))
 	}
-	return s.config.MinDelay + rand.N(spread+1)
+
+	// One roll decides the outcome: [0, crash) crashes, [crash,
+	// crash+error) fails, and the rest succeed.
+	roll := random.Float64()
+	switch {
+	case roll < s.config.CrashRate:
+		return plan{delay: delay, outcome: outcomeCrash}
+	case roll < s.config.CrashRate+s.config.ErrorRate:
+		return plan{delay: delay, outcome: outcomeError}
+	default:
+		return plan{delay: delay, outcome: outcomeSuccess}
+	}
+}
+
+// randomSourceFor returns the random numbers to use for one request.
+//
+// Without a seed they are truly random. With a seed they come from hashing
+// the seed, the body, and how many times this body was seen before. A single
+// shared random sequence would not be enough: in the fair and unfair
+// experiment runs requests arrive in a different order, so the same sequence
+// would hand the errors to different requests. Hashing per request means the
+// same request is treated the same way in both runs.
+func (s *Server) randomSourceFor(body []byte) *rand.Rand {
+	if s.config.Seed == 0 {
+		return rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	}
+
+	bodyHash := sha256.Sum256(body)
+	s.mu.Lock()
+	attempt := s.timesSeen[bodyHash]
+	s.timesSeen[bodyHash] = attempt + 1
+	s.mu.Unlock()
+
+	hasher := sha256.New()
+	// Writes to a hash never fail, so there is no error to check.
+	hasher.Write(binary.LittleEndian.AppendUint64(nil, s.config.Seed))
+	hasher.Write(bodyHash[:])
+	hasher.Write(binary.LittleEndian.AppendUint64(nil, attempt))
+	sum := hasher.Sum(nil)
+
+	return rand.New(rand.NewPCG(binary.LittleEndian.Uint64(sum[0:8]), binary.LittleEndian.Uint64(sum[8:16])))
 }
 
 // buildReply makes a successful chat completion with OutputWords words.

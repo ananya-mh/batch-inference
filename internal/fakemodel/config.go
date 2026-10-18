@@ -25,6 +25,16 @@ type Config struct {
 	// CrashRate is the chance (0 to 1) that the server cuts the connection
 	// halfway through sending a reply, like a model server that died.
 	CrashRate float64
+
+	// Seed makes the delays, errors, and crashes repeatable: with the same
+	// seed, the same request gets the same treatment on every run, whatever
+	// order requests arrive in. 0 means no seed (truly random).
+	//
+	// Restart the fake model between experiment runs: it counts how often
+	// it has seen each request in memory, and the count is part of the roll.
+	// Request bodies should also differ from each other (for example, each
+	// includes its ticket number); identical bodies share one count.
+	Seed uint64
 }
 
 // DefaultConfig returns settings that look like a real, slightly unreliable
@@ -66,7 +76,8 @@ func (c Config) Validate() error {
 // map lookup instead.
 //
 // Variables: FAKE_MODEL_MIN_DELAY and FAKE_MODEL_MAX_DELAY (like "50ms"),
-// FAKE_MODEL_OUTPUT_WORDS, FAKE_MODEL_ERROR_RATE, FAKE_MODEL_CRASH_RATE.
+// FAKE_MODEL_OUTPUT_WORDS, FAKE_MODEL_ERROR_RATE, FAKE_MODEL_CRASH_RATE,
+// FAKE_MODEL_SEED.
 func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	config := DefaultConfig()
 
@@ -83,6 +94,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if err := readFloat(getenv, "FAKE_MODEL_CRASH_RATE", &config.CrashRate); err != nil {
+		return Config{}, err
+	}
+	if err := readSeed(getenv, "FAKE_MODEL_SEED", &config.Seed); err != nil {
 		return Config{}, err
 	}
 
@@ -129,6 +143,25 @@ func readFloat(getenv func(string) string, name string, target *float64) error {
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return fmt.Errorf("%s: %w", name, err)
+	}
+	*target = parsed
+	return nil
+}
+
+// readSeed sets *target from the variable name, if it is set. Seed 0 is
+// rejected, because inside Config it means "no seed" and would silently give
+// random behavior to someone who asked for a repeatable run.
+func readSeed(getenv func(string) string, name string, target *uint64) error {
+	value := getenv(name)
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if parsed == 0 {
+		return fmt.Errorf("%s: use a seed other than 0, or leave it unset for random behavior", name)
 	}
 	*target = parsed
 	return nil

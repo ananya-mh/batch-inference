@@ -5,6 +5,7 @@ package fakemodel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -220,6 +221,7 @@ func TestConfigFromEnv(t *testing.T) {
 		"FAKE_MODEL_MIN_DELAY":    "10ms",
 		"FAKE_MODEL_OUTPUT_WORDS": "7",
 		"FAKE_MODEL_CRASH_RATE":   "0",
+		"FAKE_MODEL_SEED":         "123",
 	}
 	config, err := ConfigFromEnv(func(name string) string { return env[name] })
 	if err != nil {
@@ -230,6 +232,7 @@ func TestConfigFromEnv(t *testing.T) {
 	want.MinDelay = 10 * time.Millisecond
 	want.OutputWords = 7
 	want.CrashRate = 0
+	want.Seed = 123
 	if config != want {
 		t.Errorf("config = %+v, want %+v", config, want)
 	}
@@ -242,11 +245,117 @@ func TestConfigFromEnvRejectsBadValues(t *testing.T) {
 		"FAKE_MODEL_MIN_DELAY":    "soon",
 		"FAKE_MODEL_OUTPUT_WORDS": "many",
 		"FAKE_MODEL_ERROR_RATE":   "2", // parses, but fails validation
+		"FAKE_MODEL_SEED":         "0", // would silently mean "no seed"
 	}
 	for name, value := range bad {
 		env := map[string]string{name: value}
 		if _, err := ConfigFromEnv(func(n string) string { return env[n] }); err == nil {
 			t.Errorf("%s=%q: ConfigFromEnv succeeded, want an error", name, value)
 		}
+	}
+}
+
+// seededConfig returns flaky settings with a seed, for the seed tests.
+func seededConfig(seed uint64) Config {
+	return Config{
+		MinDelay:    0,
+		MaxDelay:    time.Second,
+		OutputWords: 1,
+		ErrorRate:   0.3,
+		CrashRate:   0.2,
+		Seed:        seed,
+	}
+}
+
+// requestBodies returns count different chat request bodies.
+func requestBodies(count int) [][]byte {
+	bodies := make([][]byte, count)
+	for i := range bodies {
+		bodies[i] = []byte(fmt.Sprintf(`{"model": "fake", "messages": [{"role": "user", "content": "ticket %d"}]}`, i))
+	}
+	return bodies
+}
+
+// newTestServer builds a Server or fails the test.
+func newTestServer(t *testing.T, config Config) *Server {
+	t.Helper()
+	server, err := NewServer(config)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	return server
+}
+
+// TestSameSeedGivesSamePlansInAnyOrder checks the experiment's key need: two
+// runs with the same seed treat every request the same way, even when the
+// requests arrive in a different order.
+func TestSameSeedGivesSamePlansInAnyOrder(t *testing.T) {
+	t.Parallel()
+	bodies := requestBodies(200)
+	firstRun := newTestServer(t, seededConfig(42))
+	secondRun := newTestServer(t, seededConfig(42))
+
+	plansInOrder := make([]plan, len(bodies))
+	for i, body := range bodies {
+		plansInOrder[i] = firstRun.planFor(body)
+	}
+	// The second run sees the same requests in reverse order.
+	for i := len(bodies) - 1; i >= 0; i-- {
+		if got := secondRun.planFor(bodies[i]); got != plansInOrder[i] {
+			t.Fatalf("request %d: second run planned %+v, first run planned %+v", i, got, plansInOrder[i])
+		}
+	}
+}
+
+// TestDifferentSeedsGiveDifferentPlans checks the seed actually matters.
+func TestDifferentSeedsGiveDifferentPlans(t *testing.T) {
+	t.Parallel()
+	bodies := requestBodies(50)
+	seedOne := newTestServer(t, seededConfig(1))
+	seedTwo := newTestServer(t, seededConfig(2))
+
+	differences := 0
+	for _, body := range bodies {
+		if seedOne.planFor(body) != seedTwo.planFor(body) {
+			differences++
+		}
+	}
+	if differences == 0 {
+		t.Error("seeds 1 and 2 planned all 50 requests identically")
+	}
+}
+
+// TestSeededRetryGetsAFreshRoll checks that retrying the same request does
+// not repeat the same outcome forever, so a failed request can still
+// succeed on a later attempt.
+func TestSeededRetryGetsAFreshRoll(t *testing.T) {
+	t.Parallel()
+	server := newTestServer(t, seededConfig(7))
+	body := requestBodies(1)[0]
+
+	outcomes := map[outcome]bool{}
+	for range 30 {
+		outcomes[server.planFor(body).outcome] = true
+	}
+	if !outcomes[outcomeSuccess] || len(outcomes) < 2 {
+		t.Errorf("30 attempts of one request gave outcomes %v, want a mix including success", outcomes)
+	}
+}
+
+// TestSeededRunMatchesConfiguredRates checks seeding keeps the error and
+// crash rates roughly as configured (30% and 20% here).
+func TestSeededRunMatchesConfiguredRates(t *testing.T) {
+	t.Parallel()
+	server := newTestServer(t, seededConfig(99))
+
+	counts := map[outcome]int{}
+	for _, body := range requestBodies(5000) {
+		counts[server.planFor(body).outcome]++
+	}
+	if errorCount := counts[outcomeError]; errorCount < 1350 || errorCount > 1650 {
+		t.Errorf("errors = %d of 5000, want about 1500", errorCount)
+	}
+	if crashCount := counts[outcomeCrash]; crashCount < 850 || crashCount > 1150 {
+		t.Errorf("crashes = %d of 5000, want about 1000", crashCount)
 	}
 }
