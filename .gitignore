@@ -1,0 +1,7 @@
+# Build output
+/bin/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
