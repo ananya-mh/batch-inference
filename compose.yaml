@@ -25,6 +25,9 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/batch?sslmode=disable
       HTTP_ADDR: ":8080"
+      MAX_UPLOAD_BYTES: "104857600" # 100 MB
+      # Development tenants and keys only. Real keys never go in this file.
+      SEED_TENANTS: tenant_a=sk-dev-tenant-a,tenant_b=sk-dev-tenant-b,tenant_c=sk-dev-tenant-c,tenant_d=sk-dev-tenant-d
     ports:
       - "8080:8080"
     depends_on:

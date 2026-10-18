@@ -5,7 +5,6 @@ package database
 import (
 	"context"
 	"embed"
-	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -125,7 +124,7 @@ func applyMigration(ctx context.Context, conn *pgx.Conn, name string) error {
 	if err != nil {
 		return fmt.Errorf("begin migration %s: %w", name, err)
 	}
-	defer rollbackUnlessCommitted(ctx, tx)
+	defer RollbackUnlessCommitted(ctx, tx)
 
 	// Exec with no arguments uses Postgres's simple protocol, which allows
 	// a file to contain several statements.
@@ -139,14 +138,4 @@ func applyMigration(ctx context.Context, conn *pgx.Conn, name string) error {
 		return fmt.Errorf("commit migration %s: %w", name, err)
 	}
 	return nil
-}
-
-// rollbackUnlessCommitted undoes a transaction that was not committed. After a
-// successful commit, Rollback returns pgx.ErrTxClosed, which is expected.
-func rollbackUnlessCommitted(ctx context.Context, tx pgx.Tx) {
-	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
-		// The caller is already returning the error that caused the
-		// rollback, so just log this one.
-		slog.Error("roll back migration", "error", err)
-	}
 }

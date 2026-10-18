@@ -12,7 +12,7 @@ import (
 // TestHealthReportsOKWhenDatabaseIsUp checks the happy path of /healthz.
 func TestHealthReportsOKWhenDatabaseIsUp(t *testing.T) {
 	t.Parallel()
-	server := NewServer(testdb.New(t))
+	server := NewServer(testdb.New(t), Config{MaxUploadBytes: DefaultMaxUploadBytes})
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -27,7 +27,7 @@ func TestHealthReportsOKWhenDatabaseIsUp(t *testing.T) {
 func TestHealthReportsUnavailableWhenDatabaseIsDown(t *testing.T) {
 	t.Parallel()
 	pool := testdb.New(t)
-	server := NewServer(pool)
+	server := NewServer(pool, Config{MaxUploadBytes: DefaultMaxUploadBytes})
 	// A closed pool behaves like a database that cannot be reached.
 	pool.Close()
 
