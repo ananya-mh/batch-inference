@@ -75,9 +75,12 @@ func New(pool *pgxpool.Pool) *Metrics {
 			Help: "Requests by what happened to them: completed, failed, retried (one per retried attempt), expired, cancelled.",
 		}, []string{"tenant", "outcome"}),
 		RequestWaitSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "batch_request_wait_seconds",
-			Help:    "Time from a batch's submission until a request's model call first started.",
-			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800, 3600},
+			Name: "batch_request_wait_seconds",
+			Help: "Time from a batch's submission until a request's model call first started.",
+			// Fine-grained up to a few minutes, where the fairness story is
+			// told (seconds for small tenants, a minute or more for queued
+			// work); coarse beyond that.
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600, 1800, 3600},
 		}, []string{"tenant"}),
 		ModelCallSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "batch_model_call_seconds",

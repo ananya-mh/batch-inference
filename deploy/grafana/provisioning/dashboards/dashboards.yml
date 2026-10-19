@@ -1,0 +1,8 @@
+# Tells Grafana to load the dashboards in /var/lib/grafana/dashboards.
+apiVersion: 1
+providers:
+  - name: batch-inference
+    folder: ""
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

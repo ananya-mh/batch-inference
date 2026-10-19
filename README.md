@@ -7,8 +7,9 @@ A multi-tenant batch inference service in Go. Upload a file of AI requests, and 
 ## Run it
 
 ```sh
-docker compose up          # Postgres, the server on :8080, and a fake model on :8000
-go test -race ./...        # needs the Postgres from docker compose running
+docker compose up                        # Postgres, the server on :8080, and a fake model on :8000
+docker compose --profile monitoring up   # the same, plus Prometheus on :9090 and Grafana on :3000
+go test -race ./...                      # needs the Postgres from docker compose running
 ```
 
 The fake model pretends to be an AI model, so no GPU is needed: it waits 50 to 500 ms per request, fails 2% of requests, and cuts off 1% of replies halfway, so retries are exercised all the time. Development tenants and API keys (`sk-dev-tenant-a` to `sk-dev-tenant-d`) are set in `compose.yaml`.
@@ -217,6 +218,29 @@ The server serves Prometheus metrics at `http://localhost:8080/metrics`, and `do
 | `batch_scheduler_pass_seconds` | histogram | `outcome` | Scheduler pass duration, `ran` or `skipped` (another server held the lock) |
 
 The three per-tenant gauges are read from Postgres at each scrape and describe the whole service, so with several servers take `max()` of them across servers, not `sum()`. Outcomes are counted only after the database change that caused them commits, so rolled-back work is never counted.
+
+### Dashboard
+
+`docker compose --profile monitoring up` also starts Grafana at `http://localhost:3000` with a "Batch inference" dashboard (provisioned from `deploy/grafana/`, no login needed to view): each tenant's share of the window, busy workers, p99 wait per tenant, and outcomes per second.
+
+This is the fair-scheduling run of a real experiment. Tenant A's 3,000-request batch holds all 32 slots until tenants B, C and D submit 100 requests each; A then drops to 8 slots while each of them gets 8, and takes the whole window back once they finish. The small tenants' p99 wait stays around 10 s while tenant A's own queue keeps growing:
+
+![Grafana dashboard during a fair-scheduling run](docs/images/grafana-fair-scheduling.png)
+
+The first come, first served run right after it, for contrast (just the share-of-the-window panel): tenant A keeps all 32 slots until it is done, and only then do B, C and D get in.
+
+![Requests in flight per tenant under first come, first served](docs/images/grafana-first-come-in-flight.png)
+
+Produced with:
+
+```sh
+docker compose --profile monitoring up -d
+RUNS=1 scripts/fairness-experiment.sh                      # one fair run, then one first-come run
+scripts/grafana-screenshot.sh fair-1-1792442151 docs/images/grafana-fair-scheduling.png
+scripts/grafana-screenshot.sh fifo-1-1792442227 fifo.png   # then cropped to the top-left panel
+```
+
+The run tags come from the batches' metadata (`fair-1-…`, `fifo-1-…`); the run's raw results are in [`docs/results/fairness-2026-10-19-screenshot-run/`](docs/results/fairness-2026-10-19-screenshot-run/). The first-come image shows only the share-of-the-window panel because the other panels average over 30 seconds, so their first 30 seconds still include the end of the fair run before it.
 
 **Repeating the throughput investigation with metrics** (instead of the experiment script's own sampler), in Prometheus at `http://localhost:9090`:
 

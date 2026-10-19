@@ -1,0 +1,3 @@
+mode,run,small_completion_s,small_wait_p50_s,small_wait_p99_s,small_first_slot_s,big_completion_s,throughput_rps,arrival_gap_s,retried_jobs,busy_workers_mean,idle_worker_s,busy_workers_last10s
+fair,1,9.14,4.46,8.48,0.06,73.73,44.8,5.03,92,13.1,211,8.6
+fifo,1,66.25,61.53,64.65,62.21,66.65,46.3,5.03,92,13.4,187,12.2

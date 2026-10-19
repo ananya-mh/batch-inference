@@ -70,16 +70,37 @@ services:
       - "8000:8000"
     restart: unless-stopped
 
-  # Collects the server's metrics (http://localhost:9090). The server's raw
-  # metrics are at http://localhost:8080/metrics.
+  # Monitoring, only with: docker compose --profile monitoring up
+  # Prometheus (http://localhost:9090) collects the server's metrics; the raw
+  # metrics are always at http://localhost:8080/metrics.
   prometheus:
     image: prom/prometheus:v3.5.0
+    profiles: ["monitoring"]
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
     depends_on:
       - server
+    restart: unless-stopped
+
+  # Grafana (http://localhost:3000) with the "Batch inference" dashboard,
+  # provisioned from deploy/grafana. Anyone on this machine can view it
+  # without logging in; editing needs the admin login (admin / admin).
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["monitoring"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/batch-inference.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
     restart: unless-stopped
 
 volumes:
