@@ -13,6 +13,10 @@
 # batch's requests divided by the time from in_progress to completed. Each
 # setting restarts the server; compose.yaml's settings are restored at the
 # end. Output goes to results/throughput-<time>/.
+#
+# Keep the machine awake while it runs: on a laptop, closing the lid pauses
+# Docker and wrecks the timings. On macOS, run it as
+# caffeinate -i scripts/throughput.sh (and keep the lid open).
 
 set -euo pipefail
 
@@ -122,7 +126,7 @@ EOF
 	done
 	read -r R_MED R_MIN R_MAX <<<"$(median_range <"$WORK/rates.txt")"
 	read -r B_MED _ _ <<<"$(median_range <"$WORK/busy.txt")"
-	echo "| $LABEL | $COOLDOWN | $WORKERS | $WINDOW | $R_MED [$R_MIN–$R_MAX] | $B_MED of $WORKERS |" >>"$WORK/table.md"
+	echo "| $LABEL | $COOLDOWN | $WORKERS | $WINDOW | $R_MED [${R_MIN}–$R_MAX] | $B_MED of $WORKERS |" >>"$WORK/table.md"
 done
 
 {

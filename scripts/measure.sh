@@ -17,6 +17,10 @@
 # Each section restarts the server and fake model with the settings it needs
 # and puts compose.yaml's settings back at the end. Output goes to
 # results/measurements-<time>/ (results.md, plus raw numbers per section).
+#
+# Keep the machine awake while it runs: on a laptop, closing the lid pauses
+# Docker and wrecks the timings. On macOS, run it as
+# caffeinate -i scripts/measure.sh (and keep the lid open).
 
 set -euo pipefail
 
