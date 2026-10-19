@@ -85,7 +85,7 @@ func run() error {
 
 	httpServer := &http.Server{
 		Addr:    cfg.httpAddr,
-		Handler: api.NewServer(pool, cfg.api).Handler(),
+		Handler: api.NewServer(pool, riverClient, cfg.api).Handler(),
 		// Without timeouts, slow or stuck clients could hold connections
 		// open forever.
 		ReadHeaderTimeout: 10 * time.Second,

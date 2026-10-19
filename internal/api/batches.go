@@ -1,5 +1,5 @@
-// This file has the Batches API handlers: create a batch, get one, and list
-// them. Cancel comes with Progress item 7.
+// This file has the Batches API handlers: create a batch, get one, list
+// them, and cancel one.
 package api
 
 import (
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
+	"github.com/ananya-mh/batch-inference/internal/cancel"
 	"github.com/ananya-mh/batch-inference/internal/files"
 )
 
@@ -221,6 +222,26 @@ func (s *Server) handleGetBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toBatchObject(batch))
+}
+
+// handleCancelBatch cancels a batch and returns it, usually as cancelling.
+// Cancelling a batch that is already cancelling or cancelled returns it as it
+// is (200). A batch that has already finished or is finalizing gets 409
+// Conflict with OpenAI's wording, which the OpenAI SDKs raise as a
+// ConflictError.
+func (s *Server) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
+	batch, err := cancel.Batch(r.Context(), s.pool, s.river, tenantIDFrom(r.Context()), r.PathValue("id"))
+	var notCancellable *cancel.NotCancellableError
+	switch {
+	case errors.Is(err, batches.ErrNotFound):
+		writeError(w, http.StatusNotFound, "invalid_request_error", "no such batch")
+	case errors.As(err, &notCancellable):
+		writeError(w, http.StatusConflict, "invalid_request_error", notCancellable.Error())
+	case err != nil:
+		writeInternalError(w, r, err)
+	default:
+		writeJSON(w, http.StatusOK, toBatchObject(batch))
+	}
 }
 
 // handleListBatches returns a page of the tenant's batches, newest first.

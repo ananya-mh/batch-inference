@@ -1,5 +1,6 @@
 // Package scheduler feeds batch requests into River a few at a time. Each pass
-// writes the files of batches that are finalizing, then (under a lock) fans
+// writes the files of batches that are ending (finalizing, or cancelled with
+// nothing left running) and ends them, then (under a lock) fans
 // out new batches into requests, gives up on requests whose jobs died,
 // admits pending requests into free slots of the window, and marks batches
 // whose requests are all done as finalizing. See "Fan-out and fair
@@ -89,21 +90,22 @@ type PassResult struct {
 	GaveUp     int  // requests failed because their job ended without a result
 	Admitted   int  // requests given a River job
 	Finalizing int  // batches moved to finalizing
-	Completed  int  // batches moved to completed, with their files written
+	Completed  int  // batches moved to completed or cancelled, with their files written
 }
 
 // RunPass runs one scheduling pass.
 //
-// Finalizing batches are completed first, each in its own transaction and
-// outside the scheduler lock: writing a 50,000-line results file takes a
-// moment, and admitting other tenants' requests should not wait for it.
-// Running it first also means a batch spends at least one pass in
-// finalizing, so clients can see that status.
+// Ending batches (finalizing, or cancelling with nothing left running) are
+// completed first, each in its own transaction and outside the scheduler
+// lock: writing a 50,000-line results file takes a moment, and admitting
+// other tenants' requests should not wait for it. Running it first also
+// means a batch spends at least one pass in finalizing, so clients can see
+// that status.
 func (s *Scheduler) RunPass(ctx context.Context) (PassResult, error) {
 	var result PassResult
 	var err error
 
-	if result.Completed, err = completeFinalizingBatches(ctx, s.pool); err != nil {
+	if result.Completed, err = completeEndingBatches(ctx, s.pool); err != nil {
 		return result, err
 	}
 	if err := s.runLockedPass(ctx, &result); err != nil {

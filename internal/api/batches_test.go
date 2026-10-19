@@ -243,3 +243,57 @@ func TestListBatchesEmptyAndBadParams(t *testing.T) {
 		}
 	}
 }
+
+// postCancel sends POST /v1/batches/{id}/cancel as the tenant with apiKey.
+func postCancel(t *testing.T, handler http.Handler, apiKey, batchID string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/v1/batches/"+batchID+"/cancel", nil)
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+// TestCancelBatchEndpoint checks the cancel endpoint's answers: the batch as
+// cancelling, the same again on a second cancel, and 404 for another tenant.
+func TestCancelBatchEndpoint(t *testing.T) {
+	t.Parallel()
+	handler := newTestAPI(t, DefaultMaxUploadBytes)
+	batch := createTestBatch(t, handler, uploadBatchFile(t, handler, keyTenantA, batchLine("a")+"\n"))
+
+	if response := postCancel(t, handler, keyTenantB, batch.ID); response.Code != http.StatusNotFound {
+		t.Errorf("tenant B cancel: status %d, want 404", response.Code)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		response := postCancel(t, handler, keyTenantA, batch.ID)
+		if response.Code != http.StatusOK {
+			t.Fatalf("cancel %d: status %d, body %s", attempt, response.Code, response.Body)
+		}
+		var cancelled batchObject
+		if err := json.Unmarshal(response.Body.Bytes(), &cancelled); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if cancelled.Status != "cancelling" || cancelled.CancellingAt == nil {
+			t.Errorf("cancel %d: status %s, cancelling_at %v; want cancelling", attempt, cancelled.Status, cancelled.CancellingAt)
+		}
+	}
+}
+
+// TestCancelCompletedBatchIsConflict checks cancelling a finished batch gives
+// 409 Conflict with OpenAI's message, which the SDKs raise as ConflictError.
+func TestCancelCompletedBatchIsConflict(t *testing.T) {
+	t.Parallel()
+	handler, pool := newTestAPIWithPool(t, DefaultMaxUploadBytes)
+	batch := createTestBatch(t, handler, uploadBatchFile(t, handler, keyTenantA, batchLine("a")+"\n"))
+	if _, err := pool.Exec(context.Background(), "UPDATE batches SET status = 'completed' WHERE id = $1", batch.ID); err != nil {
+		t.Fatalf("complete batch: %v", err)
+	}
+
+	response := postCancel(t, handler, keyTenantA, batch.ID)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409", response.Code)
+	}
+	if message := errorMessage(t, response); message != "Cannot cancel a batch with status 'completed'." {
+		t.Errorf("message = %q", message)
+	}
+}

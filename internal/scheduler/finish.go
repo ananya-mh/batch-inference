@@ -85,30 +85,62 @@ func startFinalizingDoneBatches(ctx context.Context, tx pgx.Tx) (int, error) {
 		return 0, fmt.Errorf("read finished batches: %w", err)
 	}
 
+	moved := 0
 	for _, batchID := range batchIDs {
-		if err := batches.Transition(ctx, tx, batchID, batches.StatusInProgress, batches.StatusFinalizing); err != nil {
-			return 0, err
+		err := batches.Transition(ctx, tx, batchID, batches.StatusInProgress, batches.StatusFinalizing)
+		if errors.Is(err, batches.ErrStatusChanged) {
+			// Cancelled at the same moment, and the cancel won. The batch
+			// will become cancelled instead; nothing to do here.
+			continue
 		}
+		if err != nil {
+			return moved, err
+		}
+		moved++
 	}
-	return len(batchIDs), nil
+	return moved, nil
 }
 
-// completeFinalizingBatches writes the files of every finalizing batch and
-// moves it to completed, one batch per transaction, and returns how many it
-// completed.
-func completeFinalizingBatches(ctx context.Context, pool *pgxpool.Pool) (int, error) {
-	rows, err := pool.Query(ctx, "SELECT id FROM batches WHERE status = $1 ORDER BY finalizing_at", batches.StatusFinalizing)
+// endStatus is the final status each ending status leads to, once the
+// batch's files are written.
+var endStatus = map[batches.Status]batches.Status{
+	batches.StatusFinalizing: batches.StatusCompleted,
+	batches.StatusCancelling: batches.StatusCancelled,
+}
+
+// completeEndingBatches writes the files of every batch that is ready to end
+// (finalizing batches, and cancelling batches whose running requests have
+// all finished) and moves each to its final status, one batch per
+// transaction. It returns how many batches it ended.
+func completeEndingBatches(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	// A cancelling batch waits until its in-flight requests finish, so
+	// their results make it into the files.
+	rows, err := pool.Query(ctx, `
+		SELECT b.id, b.status
+		FROM batches b
+		WHERE b.status = $1
+		   OR (b.status = $2 AND NOT EXISTS (
+				SELECT 1 FROM requests r
+				WHERE r.batch_id = b.id AND r.status IN ($3, $4, $5)))
+		ORDER BY b.created_at`,
+		batches.StatusFinalizing, batches.StatusCancelling,
+		requests.StatusPending, requests.StatusQueued, requests.StatusRunning,
+	)
 	if err != nil {
-		return 0, fmt.Errorf("find finalizing batches: %w", err)
+		return 0, fmt.Errorf("find batches ready to end: %w", err)
 	}
-	batchIDs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	type endingBatch struct {
+		ID     string
+		Status batches.Status
+	}
+	ready, err := pgx.CollectRows(rows, pgx.RowToStructByPos[endingBatch])
 	if err != nil {
-		return 0, fmt.Errorf("read finalizing batches: %w", err)
+		return 0, fmt.Errorf("read batches ready to end: %w", err)
 	}
 
 	completed := 0
-	for _, batchID := range batchIDs {
-		done, err := completeBatch(ctx, pool, batchID)
+	for _, batch := range ready {
+		done, err := completeBatch(ctx, pool, batch.ID, batch.Status, endStatus[batch.Status])
 		if err != nil {
 			return completed, err
 		}
@@ -119,13 +151,14 @@ func completeFinalizingBatches(ctx context.Context, pool *pgxpool.Pool) (int, er
 	return completed, nil
 }
 
-// completeBatch writes one finalizing batch's results and errors files, sets
-// output_file_id and error_file_id, and moves it to completed, all in one
+// completeBatch writes one batch's results and errors files, sets
+// output_file_id and error_file_id, and moves it from status `from`
+// (finalizing or cancelling) to `to` (completed or cancelled), all in one
 // transaction. A crash at any point before the commit leaves no files behind
-// and the batch still finalizing, so the next pass simply does it again; the
-// files can never be written twice or half-written. It returns false if
-// another server is already completing this batch.
-func completeBatch(ctx context.Context, pool *pgxpool.Pool, batchID string) (bool, error) {
+// and the batch unchanged, so the next pass simply does it again; the files
+// can never be written twice or half-written. It returns false if another
+// server is already completing this batch.
+func completeBatch(ctx context.Context, pool *pgxpool.Pool, batchID string, from, to batches.Status) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin completing %s: %w", batchID, err)
@@ -137,7 +170,7 @@ func completeBatch(ctx context.Context, pool *pgxpool.Pool, batchID string) (boo
 	var lockedID string
 	err = tx.QueryRow(ctx,
 		"SELECT id FROM batches WHERE id = $1 AND status = $2 FOR UPDATE SKIP LOCKED",
-		batchID, batches.StatusFinalizing,
+		batchID, from,
 	).Scan(&lockedID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -156,7 +189,7 @@ func completeBatch(ctx context.Context, pool *pgxpool.Pool, batchID string) (boo
 	); err != nil {
 		return false, fmt.Errorf("record files of batch %s: %w", batchID, err)
 	}
-	if err := batches.Transition(ctx, tx, batchID, batches.StatusFinalizing, batches.StatusCompleted); err != nil {
+	if err := batches.Transition(ctx, tx, batchID, from, to); err != nil {
 		return false, err
 	}
 

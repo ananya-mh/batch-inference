@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
 )
 
 // DefaultMaxUploadBytes is the default upload size limit: 100 MB.
@@ -25,12 +27,14 @@ type Config struct {
 // Server holds what the HTTP handlers need to do their work.
 type Server struct {
 	pool   *pgxpool.Pool
+	river  *river.Client[pgx.Tx]
 	config Config
 }
 
-// NewServer returns a Server that uses pool for database access.
-func NewServer(pool *pgxpool.Pool, config Config) *Server {
-	return &Server{pool: pool, config: config}
+// NewServer returns a Server that uses pool for database access, and
+// riverClient to cancel the jobs of cancelled batches.
+func NewServer(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *Server {
+	return &Server{pool: pool, river: riverClient, config: config}
 }
 
 // Handler returns an http.Handler with every route registered. Every /v1
@@ -46,6 +50,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/batches", s.requireTenant(s.handleCreateBatch))
 	mux.HandleFunc("GET /v1/batches", s.requireTenant(s.handleListBatches))
 	mux.HandleFunc("GET /v1/batches/{id}", s.requireTenant(s.handleGetBatch))
+	mux.HandleFunc("POST /v1/batches/{id}/cancel", s.requireTenant(s.handleCancelBatch))
 	return mux
 }
 

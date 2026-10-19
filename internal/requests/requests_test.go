@@ -99,9 +99,10 @@ func TestStartMarksRunningAndReturnsBody(t *testing.T) {
 	}
 }
 
-// TestStartRefusesWhenBatchNotInProgress checks a request of a cancelling
-// batch does not start (guarantee 3).
-func TestStartRefusesWhenBatchNotInProgress(t *testing.T) {
+// TestStartCancelsRequestOfCancellingBatch checks a queued request of a
+// cancelling batch does not start, and is marked cancelled so it frees its
+// slot (guarantee 3).
+func TestStartCancelsRequestOfCancellingBatch(t *testing.T) {
 	t.Parallel()
 	pool, batchID := setupQueuedRequest(t)
 	if err := batches.Transition(context.Background(), pool, batchID, batches.StatusInProgress, batches.StatusCancelling); err != nil {
@@ -113,8 +114,8 @@ func TestStartRefusesWhenBatchNotInProgress(t *testing.T) {
 			t.Errorf("Start = started %v, err %v; want not started", started, err)
 		}
 	})
-	if status := requestStatus(t, pool, batchID); status != requests.StatusQueued {
-		t.Errorf("status = %s, want still queued", status)
+	if status := requestStatus(t, pool, batchID); status != requests.StatusCancelled {
+		t.Errorf("status = %s, want cancelled", status)
 	}
 }
 

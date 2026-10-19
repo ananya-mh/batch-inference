@@ -10,6 +10,7 @@ import (
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/database"
+	"github.com/ananya-mh/batch-inference/internal/requests"
 )
 
 // fanOut creates the request rows for every validating batch, oldest first,
@@ -37,40 +38,31 @@ func fanOut(ctx context.Context, tx pgx.Tx) (int, error) {
 	return fannedOut, nil
 }
 
-// fanOutBatch creates one batch's request rows and moves it to in_progress.
+// fanOutBatch moves one batch to in_progress and creates its request rows.
 // It returns false if the batch's status changed meanwhile (it was
 // cancelled), in which case nothing is created.
 func fanOutBatch(ctx context.Context, tx pgx.Tx, batchID string) (bool, error) {
-	// A savepoint, so a batch that turns out to be cancelled can be undone
-	// without undoing the rest of the pass.
+	// A savepoint, so one batch's failure can be undone without undoing the
+	// rest of the pass.
 	savepoint, err := tx.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin fan-out of %s: %w", batchID, err)
 	}
 	defer database.RollbackUnlessCommitted(ctx, savepoint)
 
-	// One statement for the whole batch. ORDER BY makes seq follow line
-	// order, so a batch's requests run in file order.
-	_, err = savepoint.Exec(ctx, `
-		INSERT INTO requests (batch_id, custom_id, tenant_id, line_number)
-		SELECT b.id, l.custom_id, b.tenant_id, l.line_number
-		FROM batches b
-		JOIN file_lines l ON l.file_id = b.input_file_id
-		WHERE b.id = $1
-		ORDER BY l.line_number`,
-		batchID,
-	)
-	if err != nil {
-		return false, fmt.Errorf("create requests for %s: %w", batchID, err)
-	}
-
+	// Change the status first. If the batch was cancelled meanwhile, this
+	// fails and nothing is created. Going first also locks the batch row, so
+	// a cancel arriving now waits until this pass commits, then sees
+	// in_progress and cancels the requests created here.
 	err = batches.Transition(ctx, savepoint, batchID, batches.StatusValidating, batches.StatusInProgress)
 	if errors.Is(err, batches.ErrStatusChanged) {
-		// Cancelled while we worked: the deferred rollback removes the
-		// requests just created.
 		return false, nil
 	}
 	if err != nil {
+		return false, err
+	}
+
+	if err := requests.CreateForBatch(ctx, savepoint, batchID, requests.StatusPending); err != nil {
 		return false, err
 	}
 

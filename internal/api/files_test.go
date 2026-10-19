@@ -51,7 +51,7 @@ func newTestAPIWithPool(t *testing.T, maxUploadBytes int64) (http.Handler, *pgxp
 	}
 	config := testConfig()
 	config.MaxUploadBytes = maxUploadBytes
-	return NewServer(pool, config).Handler(), pool
+	return NewServer(pool, newRiverClient(t, pool), config).Handler(), pool
 }
 
 // formField is one field of a multipart upload, in the order it is sent.

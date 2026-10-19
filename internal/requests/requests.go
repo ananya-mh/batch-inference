@@ -51,6 +51,28 @@ type Outcome struct {
 	ErrorMessage string
 }
 
+// CreateForBatch creates one request row per line of the batch's input file,
+// all with the given status: pending for a normal fan-out, or cancelled when
+// a batch is cancelled before it was fanned out (so its lines still appear in
+// the errors file). One statement for the whole batch; ORDER BY makes seq
+// follow line order, so a batch's requests run in file order.
+func CreateForBatch(ctx context.Context, tx pgx.Tx, batchID string, status Status) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO requests (batch_id, custom_id, tenant_id, line_number, status, finished_at)
+		SELECT b.id, l.custom_id, b.tenant_id, l.line_number, $2::text,
+		       CASE WHEN $2::text = $3::text THEN NULL ELSE clock_timestamp() END
+		FROM batches b
+		JOIN file_lines l ON l.file_id = b.input_file_id
+		WHERE b.id = $1
+		ORDER BY l.line_number`,
+		batchID, status, StatusPending,
+	)
+	if err != nil {
+		return fmt.Errorf("create requests for %s: %w", batchID, err)
+	}
+	return nil
+}
+
 // Start is the worker's start check, run inside tx. If the request may run,
 // it moves it to running and returns its request body with started = true.
 // It returns started = false when the request must not run: its batch is no
@@ -65,6 +87,15 @@ func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.
 	if err != nil {
 		return nil, false, fmt.Errorf("read batch %s status: %w", batchID, err)
 	}
+	if batchStatus == batches.StatusCancelling {
+		// The batch was cancelled after this job was queued (or while it
+		// waited for a retry). Mark the request cancelled so it frees its
+		// slot and lands in the errors file, and don't run it.
+		if err := cancelRequest(ctx, tx, batchID, customID); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
 	if batchStatus != batches.StatusInProgress {
 		return nil, false, nil
 	}
@@ -73,7 +104,7 @@ func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.
 	// crashed, River retries the job but the request still says running.
 	var lineNumber int
 	err = tx.QueryRow(ctx, `
-		UPDATE requests SET status = $3, started_at = now()
+		UPDATE requests SET status = $3, started_at = clock_timestamp()
 		WHERE batch_id = $1 AND custom_id = $2 AND status IN ($4, $3)
 		RETURNING line_number`,
 		batchID, customID, StatusRunning, StatusQueued,
@@ -90,6 +121,38 @@ func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.
 		return nil, false, err
 	}
 	return body, true, nil
+}
+
+// CancelIfBatchCancelling cancels the request if its batch is cancelling,
+// and reports whether it did. Workers call it when an attempt fails: a
+// request whose batch is being cancelled should not wait for a retry, since
+// that would only hold up the cancel.
+func CancelIfBatchCancelling(ctx context.Context, tx pgx.Tx, batchID, customID string) (bool, error) {
+	var batchStatus batches.Status
+	if err := tx.QueryRow(ctx, "SELECT status FROM batches WHERE id = $1", batchID).Scan(&batchStatus); err != nil {
+		return false, fmt.Errorf("read batch %s status: %w", batchID, err)
+	}
+	if batchStatus != batches.StatusCancelling {
+		return false, nil
+	}
+	if err := cancelRequest(ctx, tx, batchID, customID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// cancelRequest marks a request cancelled if it has not finished yet. A
+// request that already finished keeps its result.
+func cancelRequest(ctx context.Context, tx pgx.Tx, batchID, customID string) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE requests SET status = $3, finished_at = clock_timestamp()
+		WHERE batch_id = $1 AND custom_id = $2 AND status IN ($4, $5, $6)`,
+		batchID, customID, StatusCancelled, StatusPending, StatusQueued, StatusRunning,
+	)
+	if err != nil {
+		return fmt.Errorf("cancel request %s/%s: %w", batchID, customID, err)
+	}
+	return nil
 }
 
 // readRequestBody returns the "body" part of a batch's input line, which is
@@ -150,7 +213,7 @@ func finishFrom(ctx context.Context, tx pgx.Tx, batchID, customID string, outcom
 	// row lock taken here makes a racing attempt wait, then find the
 	// status changed and save nothing (guarantee 2).
 	tag, err := tx.Exec(ctx, `
-		UPDATE requests SET status = $3, finished_at = now()
+		UPDATE requests SET status = $3, finished_at = clock_timestamp()
 		WHERE batch_id = $1 AND custom_id = $2 AND status = ANY($4)`,
 		batchID, customID, finalStatus, fromStatuses,
 	)

@@ -101,11 +101,49 @@ func (w *Worker) Work(ctx context.Context, job *river.Job[requests.RunArgs]) err
 
 	reply, callErr := w.model.Complete(ctx, body)
 	outcome, retry := decideOutcome(reply, callErr, job.Attempt, job.MaxAttempts)
-	if retry {
-		// Returning the error makes River try again after NextRetry.
-		return callErr
+	if !retry {
+		return w.finish(ctx, job, outcome)
 	}
-	return w.finish(ctx, job, outcome)
+
+	// If the batch was cancelled while this attempt ran, don't wait for a
+	// retry that would only be cancelled anyway: that would hold up the
+	// batch becoming cancelled by the whole retry delay (see "Bugs found"
+	// in DESIGN.md).
+	cancelled, err := w.cancelIfBatchCancelling(ctx, job)
+	if err != nil {
+		return err
+	}
+	if cancelled {
+		return nil
+	}
+	// Returning the error makes River try again after NextRetry.
+	return callErr
+}
+
+// cancelIfBatchCancelling cancels the request and completes its job, in one
+// transaction, if the batch is cancelling. It reports whether it did.
+func (w *Worker) cancelIfBatchCancelling(workCtx context.Context, job *river.Job[requests.RunArgs]) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(workCtx), saveTimeout)
+	defer cancel()
+
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin cancel check: %w", err)
+	}
+	defer database.RollbackUnlessCommitted(ctx, tx)
+
+	cancelled, err := requests.CancelIfBatchCancelling(ctx, tx, job.Args.BatchID, job.Args.CustomID)
+	if err != nil || !cancelled {
+		return false, err
+	}
+	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
+		return false, fmt.Errorf("complete job: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit cancel: %w", err)
+	}
+	w.afterFinish()
+	return true, nil
 }
 
 // start runs the start check in its own short transaction, so the batch row

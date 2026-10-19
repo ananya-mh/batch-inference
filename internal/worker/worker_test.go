@@ -23,6 +23,7 @@ import (
 	"github.com/riverqueue/river"
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
+	"github.com/ananya-mh/batch-inference/internal/cancel"
 	"github.com/ananya-mh/batch-inference/internal/fakemodel"
 	"github.com/ananya-mh/batch-inference/internal/files"
 	"github.com/ananya-mh/batch-inference/internal/model"
@@ -558,5 +559,107 @@ func TestSameRequestRunTwiceSavesOneResult(t *testing.T) {
 	}
 	if results := readResults(t, pool, batch.ID); len(results) != 1 {
 		t.Errorf("%d results saved, want exactly 1", len(results))
+	}
+}
+
+// TestCancelMidBatch cancels a batch while workers are busy with a slow model.
+// No request may start after the cancel, running requests finish and keep
+// their results, and every custom_id ends up in exactly one file.
+func TestCancelMidBatch(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	modelURL := startFakeModel(t, fakemodel.Config{MinDelay: 200 * time.Millisecond, MaxDelay: 300 * time.Millisecond, OutputWords: 3})
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 60)
+	sys := newSystem(t, pool, modelURL, testWorkerConfig())
+	sys.start(t)
+
+	// Wait until some requests are done and the window is busy.
+	ctx := context.Background()
+	deadline := time.Now().Add(20 * time.Second)
+	for testfixtures.CountRequests(t, pool, batch.ID)["succeeded"] < 5 {
+		if time.Now().After(deadline) {
+			t.Fatal("no progress before cancelling")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := cancel.Batch(ctx, pool, sys.river, "tenant_a", batch.ID); err != nil {
+		t.Fatalf("cancel.Batch: %v", err)
+	}
+	waitForStatus(t, pool, batch.ID, batches.StatusCancelled, 30*time.Second)
+
+	var startedAfterCancel, succeeded, cancelled int
+	err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE r.started_at > b.cancelling_at),
+		       count(*) FILTER (WHERE r.status = 'succeeded'),
+		       count(*) FILTER (WHERE r.status = 'cancelled')
+		FROM requests r JOIN batches b ON b.id = r.batch_id
+		WHERE b.id = $1`, batch.ID).Scan(&startedAfterCancel, &succeeded, &cancelled)
+	if err != nil {
+		t.Fatalf("read requests: %v", err)
+	}
+	if startedAfterCancel != 0 {
+		t.Errorf("%d requests started after the cancel, want 0", startedAfterCancel)
+	}
+	if succeeded+cancelled != 60 || cancelled == 0 {
+		t.Errorf("%d succeeded and %d cancelled, want 60 in total with some cancelled", succeeded, cancelled)
+	}
+
+	final, err := batches.Get(ctx, pool, "tenant_a", batch.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	seen := map[string]int{}
+	for _, line := range downloadLines(t, pool, *final.OutputFileID) {
+		seen[line.CustomID]++
+	}
+	for _, line := range downloadLines(t, pool, *final.ErrorFileID) {
+		seen[line.CustomID]++
+		if !strings.Contains(string(line.Error), "batch_cancelled") {
+			t.Errorf("errors line for %s should say batch_cancelled: %s", line.CustomID, line.Error)
+		}
+	}
+	for i := range 60 {
+		if customID := fmt.Sprintf("a-%d", i); seen[customID] != 1 {
+			t.Errorf("%s appears %d times across both files, want exactly once", customID, seen[customID])
+		}
+	}
+	t.Logf("%d finished before or during the cancel, %d cancelled", succeeded, cancelled)
+}
+
+// TestCancelDoesNotWaitForRetries cancels while every request is mid-call to a
+// model that always fails. Those attempts must not wait for a retry; the
+// batch must become cancelled long before the (deliberately long) retry
+// delay would pass, with no request tried twice.
+func TestCancelDoesNotWaitForRetries(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	modelURL := startFakeModel(t, fakemodel.Config{MinDelay: 300 * time.Millisecond, MaxDelay: 300 * time.Millisecond, OutputWords: 3, ErrorRate: 1})
+	config := testWorkerConfig()
+	config.RetryBaseDelay = 10 * time.Second
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 20)
+	sys := newSystem(t, pool, modelURL, config)
+	sys.start(t)
+
+	ctx := context.Background()
+	deadline := time.Now().Add(10 * time.Second)
+	for testfixtures.CountRequests(t, pool, batch.ID)["running"] == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no request started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	if _, err := cancel.Batch(ctx, pool, sys.river, "tenant_a", batch.ID); err != nil {
+		t.Fatalf("cancel.Batch: %v", err)
+	}
+	waitForStatus(t, pool, batch.ID, batches.StatusCancelled, 30*time.Second)
+
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("cancelled after %s; the 10 s retry delay was waited out", elapsed)
+	}
+	for _, attempts := range jobAttempts(t, pool, batch.ID) {
+		if attempts > 1 {
+			t.Errorf("a job ran %d attempts, want at most 1 (no retries after the cancel)", attempts)
+		}
 	}
 }
