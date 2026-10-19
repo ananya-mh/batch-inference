@@ -1,0 +1,45 @@
+
+==> Starting the stack (build output goes to a log, shown only on failure)
+
+==> Uploading 500 requests and creating a batch (completion window 30s)
+batch batch_72nsatvmouledjgae6aekpi3sf
+
+==> Waiting until 50 requests (10%) are done
+54 done
+
+==> Killing the server with SIGKILL (31 requests in flight, 12 mid-call to the model)
+
+==> Keeping the server down until 10s after the deadline (39s)
+
+==> Restarting the server
+
+==> Waiting for the batch to be expired
+status: expired
+
+==> Checking the database
+  ok    batch expired
+  ok    every custom_id is in exactly one output file (500 lines, 500 distinct)
+  ok    no request has more than one result (68 results, 68 distinct)
+  ok    the crash really interrupted work (12 requests were mid-call)
+  ok    every request finished before the deadline or expired (68 + 0 + 432)
+  ok    no result saved after the deadline was kept (0)
+  ok    expired requests say batch_expired in the errors file (432)
+  ok    expired within 5s of the restart (0s)
+
+==================== crash test summary ====================
+ Mode:                      expiry
+ Result:                    PASS
+ Requests in batch:         500
+ Killed at:                 54 done, 31 in flight (12 mid-call)
+ Jobs rescued by River:     0
+ Jobs retried (any reason): 1
+ Results saved:             68 (68 distinct custom_ids)
+ Succeeded / failed:        68 / 0
+ Expired:                   432
+ Server down past deadline: 10s
+ Expired after restart:     0s (11.6s after the deadline)
+ Expired after server start: 0.71s
+ Results / errors file:     68 / 432 lines
+=============================================================
+
+==> Restoring the normal server settings

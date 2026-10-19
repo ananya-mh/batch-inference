@@ -127,7 +127,14 @@ The `--expiry` variant gives the batch a 30-second completion window and keeps t
 
 For these tests the server rescues jobs of a dead worker after 20 seconds instead of the usual 5 minutes.
 
-## Fairness experiment (noisy neighbor)
+## Measurements
+
+All on one machine. Apple M5 (10 cores), 16 GB RAM, macOS 26.6.2. Docker 29.7.2 with 10 CPUs and 7.7 GB for its VM (everything below runs inside it). Postgres 17.11 (Debian 17.11-1.pgdg13+2), server built with go1.27.2. Every number below comes from a script in this repo (or, in the throughput-gap investigation, from the SQL query shown with it); each section names the command, the commit, and how many runs or requests it is based on, and links to the raw output in [`docs/results/`](docs/results/).
+
+### Fairness experiment (noisy neighbor)
+
+Code at commit `9e56f02`, with the experiment script as committed in `1a2532e`; run on 2026-10-19.
+
 
 Tenant A submits one big batch; 5 seconds later tenants B, C and D each submit a small one. The same scenario runs with fair scheduling and with first come, first served, 5 times each, under identical conditions: same input files, same arrival timing, and the same fake model seed (so every request gets the same delay and the same errors in every run; the fake model is restarted before each run). Settings as in `compose.yaml`: 16 workers, a window of 32, fake model at 50–500 ms per request.
 
@@ -167,7 +174,7 @@ big,   fifo     66.8  ####################################
 
 What it shows: with fair scheduling the small tenants get their first slot within 0.1 s of submitting and finish about 9 s after submitting; first come, first served makes them wait about 62 s for the big batch to get out of the way. The cost is that the big batch finishes about 7 s (10%) later, since it shares the window. Total throughput is about 3% lower with fair scheduling in this run; the next section explains why.
 
-### Investigating the throughput gap
+#### Investigating the throughput gap
 
 The hypothesis: with fair scheduling the big tenant finishes last, so its final retries hold slots during their backoff while the other workers sit idle. Two checks.
 
@@ -204,6 +211,37 @@ JOIN river_job j ON j.args->>'batch_id' = b.id AND j.args->>'custom_id' = 'a-234
 which gave 5 attempts in all 10 runs, done 0.1–0.2 s before the end in the fair runs and 3.5–4.5 s before the end in the first-come runs.
 
 So the gap is a tail effect of one unlucky request's retry chain, not a slowdown while the batch is running: on average over the run, 13.1 against 13.5 workers are busy, and most of that difference is the tail. It would shrink as the big batch grows.
+
+### Throughput
+
+How many requests per second the service itself can push through, with a near-instant fake model so the model is never the limit. From `REQUESTS=10000 RUNS=3 scripts/throughput.sh`, commit `d41e264`, run on 2026-10-19 ([raw data](docs/results/throughput-2026-10-19/)):
+
+| Setting | RIVER_FETCH_COOLDOWN | WORKERS | SCHEDULER_WINDOW | Requests/s | Busy workers (average) |
+|---|---|---|---|---|---|
+| defaults (River's 100 ms fetch cooldown) | 100ms | 16 | 32 | 157 [157–157] | 1.3 of 16 |
+| fetch cooldown 50 ms | 50ms | 16 | 32 | 311 [311–312] | 1.2 of 16 |
+| fetch cooldown 10 ms | 10ms | 16 | 32 | 1416 [1388–1453] | 8.6 of 16 |
+| fetch cooldown 1 ms | 1ms | 16 | 32 | 2203 [2113–2236] | 11.7 of 16 |
+| fetch cooldown 1 ms, window 128 | 1ms | 16 | 128 | 2105 [2079–2154] | 11.9 of 16 |
+| fetch cooldown 1 ms, 64 workers, window 128 | 1ms | 64 | 128 | 3278 [3244–3340] | 36.6 of 64 |
+
+**What limits it.** With River's default settings throughput is about 160 requests/s, and it is River's fetch cooldown: River fetches new jobs at most once per `RIVER_FETCH_COOLDOWN` (100 ms by default, and River's own docs say "throughput is limited by this value"), taking at most as many jobs as there are free workers, so 16 workers can start at most 16 × 10 = 160 jobs a second. The table bears this out: halving the cooldown doubles throughput (157 → 311 requests/s), and at 100 ms only about 1.3 of 16 workers are busy, because they spend most of their time waiting for the next fetch. At 10 ms throughput reaches about 1,400 requests/s (the cooldown alone would allow 1,600), and from 1 ms other limits take over: a bigger window changes nothing, more workers help (64 workers reach about 3,300 requests/s with 37 busy), so what is left is the per-request work (the start check, the save, the scheduler) and CPU in the Docker VM.
+
+**Does it matter with a real model?** Less: 16 workers calling a model that takes 0.5 s can only do about 32 requests/s however fast River fetches. But a 100 ms cooldown also adds up to 100 ms of idle time before each worker's next job, which is probably part of why the fairness experiment (model at 50–500 ms, 0.275 s on average) reached about 45 requests/s rather than the 16 / 0.275 ≈ 58 that 16 workers could do (not measured separately). Lowering it (say to 10 ms) costs only more frequent, cheap fetch queries; the default is left at River's 100 ms for now, so the numbers above stay comparable.
+
+### Other measurements
+
+Commit `d41e264`, run on 2026-10-19. Settings are compose.yaml's (16 workers, window of 32, fake model at 50–500 ms with 2% errors and 1% cut-off replies) unless a row says otherwise. The `status` rows use a near-instant fake model (1–5 ms, no errors) and `RIVER_FETCH_COOLDOWN=10ms` so 50,000-request batches finish in minutes; status latency and file writing depend on batch size, not model speed. Raw output: [`docs/results/measurements-2026-10-19/`](docs/results/measurements-2026-10-19/).
+
+| Measurement | Result | Based on | Command |
+|---|---|---|---|
+| Upload a 90.4 MB, 440,000-line file (checked line by line as it streams in) | 3.35 s median [3.26–3.36], 27 MB/s; server memory peaked at 64 MiB | 3 uploads | `scripts/measure.sh upload` |
+| Batch status (`GET /v1/batches/{id}`) on a 50,000-request batch, while it runs | p50 5.7 ms, p90 6.8 ms, p99 12.1 ms, max 35.6 ms | 600 requests (200 per batch, 3 batches) | `scripts/measure.sh status` |
+| Batch status on a 50,000-request batch, after it completes | p50 5.2 ms, p90 6.1 ms, p99 9.1 ms, max 13.1 ms | 600 requests (200 per batch, 3 batches) | `scripts/measure.sh status` |
+| Write the results file of a completed 50,000-request batch (inside Postgres) | 0.851 s median [0.769–0.885] | 3 batches | `scripts/measure.sh status` |
+| Cancel → `cancelled`, window of 32 full, fake model 50–500 ms | 0.455 s median [0.34–0.57]; the cancel call itself returns in 24 ms; 11.5 [9–15] requests were mid-call | 10 cancels | `scripts/measure.sh cancel` |
+| Deadline → `expired` (server running), 2,000-request batch with a 10 s window | 21.5 ms median [2.7–34] | 5 batches | `scripts/measure.sh expiry` |
+| Overdue batch after a restart (server killed mid-batch, down until 10 s past the deadline): server start → `expired` | 0.71 s median [0.71–0.72] | 3 crash tests, 500 requests each | `scripts/measure.sh overdue` |
 
 ## Metrics
 
@@ -258,16 +296,36 @@ sum by (outcome) (rate(batch_request_outcomes_total[1m]))   # completed, retried
 
 ## Settings
 
+Server settings, read from environment variables (`compose.yaml` sets the development values):
+
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `DATABASE_URL` | (required) | Postgres connection string |
+| `HTTP_ADDR` | `:8080` | Address the API listens on |
 | `MODEL_BASE_URL` | `http://localhost:8000/v1` | Any OpenAI-compatible server (the fake model, vLLM, ...) |
 | `MODEL_API_KEY` | (none) | Only needed for hosted providers |
 | `WORKERS` | 16 | Requests sent to the model at once |
-| `SCHEDULER_WINDOW` | 2 × `WORKERS` | Most requests in the queue at once |
-| `FAIR_SCHEDULING` | `true` | `false` = first come, first served (the experiment's baseline) |
+| `SCHEDULER_WINDOW` | 2 × `WORKERS` | Most requests queued or running at once |
+| `FAIR_SCHEDULING` | `true` | `true`: each free slot goes to the tenant with the fewest requests in flight. `false`: first come, first served (the experiment's baseline) |
 | `MAX_ATTEMPTS` | 5 | Tries per request |
 | `JOB_TIMEOUT` | 2m | Longest one model call may take |
+| `RESCUE_STUCK_JOBS_AFTER` | 5m | How long a job may stay running before River assumes its worker died and runs it again; must be longer than `JOB_TIMEOUT` |
+| `SCHEDULER_INTERVAL` | 200ms | How often the scheduler runs when no finished request nudges it sooner |
+| `RIVER_FETCH_COOLDOWN` | 100ms | Shortest time between River's fetches of new jobs; caps throughput at about `WORKERS` / cooldown (see [Throughput](#throughput)) |
+| `RIVER_FETCH_POLL_INTERVAL` | 1s | How often River looks for jobs when it hears of none |
 | `COMPLETION_WINDOWS` | `24h` | Allowed completion windows (tests add short ones like `10s`) |
 | `MAX_UPLOAD_BYTES` | 104857600 | Upload size limit (100 MB) |
-| `SEED_TENANTS` | (none) | Tenants to create at startup: `tenant_a=key,tenant_b=key` |
+| `MAX_BATCH_REQUESTS` | 50000 | Most requests in one batch, as with OpenAI; a bigger file is refused when the batch is created |
+| `SEED_TENANTS` | (none) | **Development only.** Tenants and API keys to create at startup: `tenant_a=key,tenant_b=key`. There is no sign-up; real deployments should create tenants another way and never put keys in a file |
+
+Fake model settings (`cmd/fakemodel`), the pretend AI model used in development and tests:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `FAKE_MODEL_ADDR` | `:8000` | Address it listens on (vLLM's default port) |
+| `FAKE_MODEL_MIN_DELAY` | 50ms | Shortest time to answer a request |
+| `FAKE_MODEL_MAX_DELAY` | 500ms | Longest time to answer a request (each request waits a random time in between) |
+| `FAKE_MODEL_OUTPUT_WORDS` | 20 | Words in each reply |
+| `FAKE_MODEL_ERROR_RATE` | 0.02 | Share of requests answered with HTTP 500 |
+| `FAKE_MODEL_CRASH_RATE` | 0.01 | Share of replies cut off halfway (a 200 status, half the body, then the connection drops) |
+| `FAKE_MODEL_SEED` | (none) | Makes delays, errors and cut-offs repeatable per request; unset means truly random |

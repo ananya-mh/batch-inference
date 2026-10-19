@@ -1,16 +1,18 @@
 # Experiment results
 
-Raw output of `scripts/fairness-experiment.sh`, copied unchanged from its `results/` folder. The main README's fairness numbers come from the first two; the third is the run its Grafana screenshots were taken from.
+Raw output of the measurement scripts, copied unchanged from their `results/` folders. The main README's fairness numbers come from the first two folders, its Grafana screenshots from the third, and its throughput and other measurements from the last two.
 
 | Folder | Command |
 |--------|---------|
 | [`fairness-2026-10-19-normal-rates/`](fairness-2026-10-19-normal-rates/) | `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0.02 CRASH_RATE=0.01 scripts/fairness-experiment.sh` |
 | [`fairness-2026-10-19-no-errors/`](fairness-2026-10-19-no-errors/) | `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0 CRASH_RATE=0 scripts/fairness-experiment.sh` |
 | [`fairness-2026-10-19-screenshot-run/`](fairness-2026-10-19-screenshot-run/) | `RUNS=1 scripts/fairness-experiment.sh`, with `docker compose --profile monitoring up` running; the run behind the README's Grafana screenshots (run tags `fair-1-1792442151` and `fifo-1-1792442227`) |
+| [`throughput-2026-10-19/`](throughput-2026-10-19/) | `REQUESTS=10000 RUNS=3 scripts/throughput.sh` at commit `d41e264`: requests per second under different River fetch cooldowns, worker counts and windows |
+| [`measurements-2026-10-19/`](measurements-2026-10-19/) | `scripts/measure.sh` at commit `d41e264`: upload, status latency, results file write, cancel, expiry, overdue after restart; `results.md` is the table, the `.txt` files are the per-run numbers |
 
-All three ran on 2026-10-19 on a laptop (Docker Desktop on macOS, 10 CPUs) with `compose.yaml`'s settings: 16 workers, a window of 32, fake model at 50–500 ms per request.
+All ran on 2026-10-19 on a laptop (Docker Desktop on macOS, 10 CPUs) with `compose.yaml`'s settings: 16 workers, a window of 32, fake model at 50–500 ms per request.
 
-## Files in each folder
+## Files in the fairness folders
 
 - **`results.md`**: the summary table (median and range per mode) and the bar chart, exactly as the script printed them.
 - **`runs.csv`**: one row per run (fair and first come, first served, alternating: 5 of each in the first two folders, 1 of each in the screenshot run). Times are seconds, measured from each tenant's own submission:

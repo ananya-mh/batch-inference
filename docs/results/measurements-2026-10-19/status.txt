@@ -1,0 +1,3 @@
+batch 1: files written in 0.885s
+batch 2: files written in 0.851s
+batch 3: files written in 0.769s

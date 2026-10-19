@@ -1,0 +1,10 @@
+run 1: cancel call 0.020182s, cancelled 0.482s after cancelling, 11 were mid-call
+run 2: cancel call 0.028560s, cancelled 0.414s after cancelling, 9 were mid-call
+run 3: cancel call 0.030295s, cancelled 0.399s after cancelling, 15 were mid-call
+run 4: cancel call 0.026136s, cancelled 0.568s after cancelling, 15 were mid-call
+run 5: cancel call 0.025520s, cancelled 0.556s after cancelling, 15 were mid-call
+run 6: cancel call 0.021995s, cancelled 0.470s after cancelling, 11 were mid-call
+run 7: cancel call 0.016892s, cancelled 0.494s after cancelling, 15 were mid-call
+run 8: cancel call 0.031923s, cancelled 0.434s after cancelling, 10 were mid-call
+run 9: cancel call 0.021725s, cancelled 0.439s after cancelling, 12 were mid-call
+run 10: cancel call 0.018661s, cancelled 0.337s after cancelling, 11 were mid-call

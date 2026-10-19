@@ -1,0 +1,3 @@
+upload 1: 3.354069s, server memory 22 MiB before, peak 64 MiB
+upload 2: 3.356784s, server memory 64 MiB before, peak 64 MiB
+upload 3: 3.264377s, server memory 63 MiB before, peak 63 MiB
