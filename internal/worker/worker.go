@@ -100,6 +100,17 @@ func (w *Worker) Work(ctx context.Context, job *river.Job[requests.RunArgs]) err
 	}
 
 	reply, callErr := w.model.Complete(ctx, body)
+	// If the job's own context was cancelled (not timed out), this server is
+	// shutting down, or River was asked to cancel the job. Either way the
+	// request did not fail. Snoozing for zero seconds hands the job back to
+	// run again as soon as a worker is free, without counting this attempt;
+	// returning the error instead would use up an attempt, and on the last
+	// one a routine restart would fail the request (see "Bugs found"). The
+	// context is checked rather than the error, because the error carries
+	// River's cancel reason ("stop initiated"), not context.Canceled.
+	if callErr != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return river.JobSnooze(0)
+	}
 	outcome, retry := decideOutcome(reply, callErr, job.Attempt, job.MaxAttempts)
 	if !retry {
 		return w.finish(ctx, job, outcome)
@@ -176,13 +187,6 @@ func decideOutcome(reply []byte, callErr error, attempt, maxAttempts int) (outco
 	var permanent *model.PermanentError
 	if errors.As(callErr, &permanent) {
 		return requests.Outcome{ErrorCode: "model_rejected", ErrorMessage: permanent.Error()}, false
-	}
-
-	// Cancelled means this server is shutting down, not that the request
-	// failed: never use up the last attempt on it. (A job timeout shows up
-	// as DeadlineExceeded instead, and does count.)
-	if errors.Is(callErr, context.Canceled) {
-		return requests.Outcome{}, true
 	}
 
 	if attempt >= maxAttempts {

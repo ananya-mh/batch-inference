@@ -63,6 +63,9 @@ func newSystem(t *testing.T, pool *pgxpool.Pool, modelURL string, config worker.
 func newSystemWithFairness(t *testing.T, pool *pgxpool.Pool, modelURL string, config worker.Config, fair bool) *system {
 	t.Helper()
 	sys := &system{pool: pool}
+	// Registered before start's cleanup, so it runs after the workers have
+	// stopped: whatever the test did, the invariants must hold at the end.
+	t.Cleanup(func() { testfixtures.CheckIntegrity(t, pool) })
 	riverClient, err := worker.NewRiverClient(pool, model.NewClient(modelURL, ""), config, func() { sys.scheduler.Nudge() })
 	if err != nil {
 		t.Fatalf("NewRiverClient: %v", err)
@@ -786,4 +789,59 @@ func TestSmallTenantNotBlockedByBigBatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestShutdownMidRequestKeepsItsAttempt stops the workers while a request is
+// mid-call (as a graceful server shutdown does, cancelling running jobs),
+// then starts new workers. The interrupted attempt must not count: even with
+// a single attempt allowed, the request runs again and succeeds instead of
+// being given up as failed (guarantee 1).
+func TestShutdownMidRequestKeepsItsAttempt(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	ctx := context.Background()
+	modelURL := startFakeModel(t, fakemodel.Config{MinDelay: time.Second, MaxDelay: time.Second, OutputWords: 3})
+	config := testWorkerConfig()
+	config.MaxAttempts = 1
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 1)
+
+	// First "server": its workers pick up the request, and it shuts down
+	// while the request is mid-call.
+	first := newSystem(t, pool, modelURL, config)
+	if _, err := first.scheduler.RunPass(ctx); err != nil {
+		t.Fatalf("RunPass: %v", err)
+	}
+	if err := first.river.Start(ctx); err != nil {
+		t.Fatalf("start first workers: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for testfixtures.CountRequests(t, pool, batch.ID)["running"] == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("request never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := first.river.StopAndCancel(stopCtx); err != nil {
+		t.Fatalf("stop first workers: %v", err)
+	}
+
+	// Second "server" starts up.
+	newSystem(t, pool, modelURL, config).start(t)
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	results := readResults(t, pool, batch.ID)
+	if len(results) != 1 || !results[0].Succeeded {
+		t.Errorf("result = %s, want success; the shutdown used up the only attempt", describeResults(results))
+	}
+}
+
+// describeResults summarizes results for test output.
+func describeResults(results []result) string {
+	parts := make([]string, len(results))
+	for i, r := range results {
+		parts[i] = fmt.Sprintf("%s succeeded=%v error=%s", r.CustomID, r.Succeeded, describeError(r))
+	}
+	return strings.Join(parts, "; ")
 }

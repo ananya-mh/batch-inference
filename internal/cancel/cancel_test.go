@@ -374,3 +374,62 @@ func TestCancelAndFinalizeRace(t *testing.T) {
 	}
 	t.Logf("outcomes over 20 rounds: %v", outcomes)
 }
+
+// TestCancelAndFanOutRace cancels a brand-new batch at the same moment the
+// scheduler fans it out, 20 times. Either may go first, but neither may fail,
+// every line must end up as exactly one cancelled request, and the files must
+// list each line once.
+func TestCancelAndFanOutRace(t *testing.T) {
+	t.Parallel()
+	pool, riverClient, s := setup(t, 100)
+	ctx := context.Background()
+	outcomes := map[string]int{}
+
+	for round := range 20 {
+		batch := testfixtures.CreateBatch(t, pool, "tenant_a", fmt.Sprintf("r%d", round), 5)
+
+		var cancelErr, passErr error
+		var start, done sync.WaitGroup
+		start.Add(1)
+		done.Add(2)
+		go func() {
+			defer done.Done()
+			start.Wait()
+			_, cancelErr = cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+		}()
+		go func() {
+			defer done.Done()
+			start.Wait()
+			_, passErr = s.RunPass(ctx)
+		}()
+		start.Done()
+		done.Wait()
+		if cancelErr != nil || passErr != nil {
+			t.Fatalf("round %d: cancel error %v, pass error %v", round, cancelErr, passErr)
+		}
+
+		runPass(t, s) // end the batch
+		final, err := batches.Get(ctx, pool, "tenant_a", batch.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if final.InProgressAt != nil {
+			outcomes["fanned out, then cancelled"]++
+		} else {
+			outcomes["cancelled before fan-out"]++
+		}
+		statuses := requestStatuses(t, pool, batch.ID)
+		if final.Status != batches.StatusCancelled || len(statuses) != 5 {
+			t.Fatalf("round %d: batch %s with %d requests, want cancelled with 5", round, final.Status, len(statuses))
+		}
+		for customID, status := range statuses {
+			if status != "cancelled" {
+				t.Errorf("round %d: %s is %s, want cancelled", round, customID, status)
+			}
+		}
+		if lines := readFile(t, pool, final.ErrorFileID); len(lines) != 5 {
+			t.Errorf("round %d: errors file has %d lines, want 5", round, len(lines))
+		}
+	}
+	t.Logf("outcomes over 20 rounds: %v", outcomes)
+}
