@@ -131,7 +131,7 @@ scripts/fairness-experiment.sh                 # defaults: 3,000-request big bat
 BIG=50000 scripts/fairness-experiment.sh       # the full-size experiment (not yet run)
 ```
 
-A real run, `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0.02 CRASH_RATE=0.01 scripts/fairness-experiment.sh`:
+A real run, `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0.02 CRASH_RATE=0.01 scripts/fairness-experiment.sh` (raw data: [per-run CSV, busy-worker samples, and chart](docs/results/fairness-2026-10-19-normal-rates/)):
 
 Tenant A: one batch of 3000 requests. Tenants B, C, D: one batch of 100 requests each, submitted 5s after A's.
 Fake model: 50–500 ms per request, error rate 0.02, cut-off-reply rate 0.01, seed 42. 16 workers, window of 32.
@@ -166,7 +166,7 @@ What it shows: with fair scheduling the small tenants get their first slot withi
 
 The hypothesis: with fair scheduling the big tenant finishes last, so its final retries hold slots during their backoff while the other workers sit idle. Two checks.
 
-**(a) Turn errors and cut-off replies off.** If retries cause the gap, it should disappear. It does: throughput is the same in both modes. From `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0 CRASH_RATE=0 scripts/fairness-experiment.sh`:
+**(a) Turn errors and cut-off replies off.** If retries cause the gap, it should disappear. It does: throughput is the same in both modes ([raw data](docs/results/fairness-2026-10-19-no-errors/)). From `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0 CRASH_RATE=0 scripts/fairness-experiment.sh`:
 
 | Metric | Fair scheduling | First come, first served |
 |---|---|---|
