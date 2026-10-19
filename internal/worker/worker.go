@@ -150,7 +150,7 @@ func decideOutcome(reply []byte, callErr error, attempt, maxAttempts int) (outco
 	if attempt >= maxAttempts {
 		return requests.Outcome{
 			ErrorCode:    "retries_exhausted",
-			ErrorMessage: fmt.Sprintf("failed after %d attempts; last error: %v", attempt, callErr),
+			ErrorMessage: fmt.Sprintf("failed on attempt %d of %d; last error: %v", attempt, maxAttempts, callErr),
 		}, false
 	}
 	return requests.Outcome{}, true

@@ -16,8 +16,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// PurposeBatch is the purpose of a file uploaded as batch input.
-const PurposeBatch = "batch"
+// File purposes, using OpenAI's names.
+const (
+	PurposeBatch       = "batch"        // uploaded batch input
+	PurposeBatchOutput = "batch_output" // results of a batch's successful requests
+	PurposeBatchError  = "batch_error"  // a batch's failed, expired, and cancelled requests
+)
 
 // MaxLineBytes is the longest line we accept. A line holds one request, so
 // this is far more than any real prompt needs.
@@ -49,7 +53,7 @@ type File struct {
 // back so nothing is saved.
 func CreateBatchInput(ctx context.Context, tx pgx.Tx, tenantID, filename string, content io.Reader) (File, error) {
 	file := File{
-		ID:       newFileID(),
+		ID:       NewFileID(),
 		TenantID: tenantID,
 		Purpose:  PurposeBatch,
 		Filename: filename,
@@ -235,7 +239,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// newFileID returns a new random ID like "file-k3j...".
-func newFileID() string {
+// NewFileID returns a new random ID like "file-k3j...".
+func NewFileID() string {
 	return "file-" + strings.ToLower(cryptorand.Text())
 }

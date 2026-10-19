@@ -221,10 +221,12 @@ func Transition(ctx context.Context, db DB, batchID string, from, to Status) err
 	}
 
 	// The column name comes from our own fixed map, never from input, so
-	// putting it into the SQL text is safe.
+	// putting it into the SQL text is safe. clock_timestamp() is the time
+	// of this change; now() would be when the transaction began, which for
+	// completing a batch is before its files were written.
 	column := timestampColumn[to]
 	tag, err := db.Exec(ctx,
-		"UPDATE batches SET status = $1, "+column+" = now() WHERE id = $2 AND status = $3",
+		"UPDATE batches SET status = $1, "+column+" = clock_timestamp() WHERE id = $2 AND status = $3",
 		to, batchID, from,
 	)
 	if err != nil {

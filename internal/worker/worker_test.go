@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/fakemodel"
+	"github.com/ananya-mh/batch-inference/internal/files"
 	"github.com/ananya-mh/batch-inference/internal/model"
 	"github.com/ananya-mh/batch-inference/internal/requests"
 	"github.com/ananya-mh/batch-inference/internal/scheduler"
@@ -189,6 +191,106 @@ func TestBatchRunsEndToEnd(t *testing.T) {
 	}
 	if got.InProgressAt == nil || got.FinalizingAt == nil || got.CompletedAt == nil {
 		t.Errorf("missing status times: %+v", got)
+	}
+	// Nothing failed, so there is a results file and no errors file.
+	if got.OutputFileID == nil || got.ErrorFileID != nil {
+		t.Fatalf("output file %v, error file %v; want only an output file", got.OutputFileID, got.ErrorFileID)
+	}
+	if lines := downloadLines(t, pool, *got.OutputFileID); len(lines) != 30 {
+		t.Errorf("results file has %d lines, want 30", len(lines))
+	}
+}
+
+// fileLine is the part of a results or errors file line these tests check.
+type fileLine struct {
+	CustomID string          `json:"custom_id"`
+	Response json.RawMessage `json:"response"`
+	Error    json.RawMessage `json:"error"`
+}
+
+// downloadLines downloads tenant_a's file and decodes its lines.
+func downloadLines(t *testing.T, pool *pgxpool.Pool, fileID string) []fileLine {
+	t.Helper()
+	var content bytes.Buffer
+	if err := files.WriteContent(context.Background(), pool, "tenant_a", fileID, &content); err != nil {
+		t.Fatalf("download %s: %v", fileID, err)
+	}
+	var lines []fileLine
+	for _, text := range strings.Split(strings.TrimSuffix(content.String(), "\n"), "\n") {
+		var line fileLine
+		if err := json.Unmarshal([]byte(text), &line); err != nil {
+			t.Fatalf("bad line %q: %v", text, err)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// TestEveryCustomIDInExactlyOneFile runs a batch where the model rejects some
+// requests, and checks every custom_id of the input appears exactly once
+// across the results and errors files: successes in one, failures in the
+// other.
+func TestEveryCustomIDInExactlyOneFile(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	healthy, err := fakemodel.NewServer(fakemodel.Config{OutputWords: 3})
+	if err != nil {
+		t.Fatalf("fakemodel.NewServer: %v", err)
+	}
+	// Reject every request whose ticket number ends in 3 or 7.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		if bytes.Contains(body, []byte("3\"")) || bytes.Contains(body, []byte("7\"")) {
+			http.Error(w, `{"error": {"message": "rejected"}}`, http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		healthy.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 40)
+	newSystem(t, pool, server.URL+"/v1", testWorkerConfig()).start(t)
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	got, err := batches.Get(context.Background(), pool, "tenant_a", batch.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.OutputFileID == nil || got.ErrorFileID == nil {
+		t.Fatalf("output file %v, error file %v; want both", got.OutputFileID, got.ErrorFileID)
+	}
+
+	seen := map[string]int{}
+	for _, line := range downloadLines(t, pool, *got.OutputFileID) {
+		seen[line.CustomID]++
+		if string(line.Error) != "null" || string(line.Response) == "null" {
+			t.Errorf("results line for %s should have a response and no error", line.CustomID)
+		}
+	}
+	failures := 0
+	for _, line := range downloadLines(t, pool, *got.ErrorFileID) {
+		seen[line.CustomID]++
+		failures++
+		if string(line.Response) != "null" || !strings.Contains(string(line.Error), "model_rejected") {
+			t.Errorf("errors line for %s should have no response and a model_rejected error", line.CustomID)
+		}
+	}
+	if failures != 8 {
+		t.Errorf("%d lines in the errors file, want 8 (ticket numbers ending in 3 or 7)", failures)
+	}
+	for i := range 40 {
+		customID := fmt.Sprintf("a-%d", i)
+		if seen[customID] != 1 {
+			t.Errorf("%s appears %d times across both files, want exactly once", customID, seen[customID])
+		}
+	}
+	if len(seen) != 40 {
+		t.Errorf("%d distinct custom_ids across both files, want 40", len(seen))
 	}
 }
 
@@ -434,18 +536,27 @@ func TestSameRequestRunTwiceSavesOneResult(t *testing.T) {
 	sys.start(t)
 
 	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+	// The batch completes as soon as the first job saves; the second job
+	// may still be finishing, so wait for both jobs.
+	deadline := time.Now().Add(10 * time.Second)
+	var unfinishedJobs int
+	for {
+		if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM river_job WHERE state <> 'completed'").Scan(&unfinishedJobs); err != nil {
+			t.Fatalf("count jobs: %v", err)
+		}
+		if unfinishedJobs == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if unfinishedJobs != 0 {
+		t.Errorf("%d jobs did not complete, want both completed", unfinishedJobs)
+	}
 
 	if calls.Load() != 2 {
 		t.Fatalf("model was called %d times, want 2 (both jobs ran)", calls.Load())
 	}
 	if results := readResults(t, pool, batch.ID); len(results) != 1 {
 		t.Errorf("%d results saved, want exactly 1", len(results))
-	}
-	var unfinishedJobs int
-	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM river_job WHERE state <> 'completed'").Scan(&unfinishedJobs); err != nil {
-		t.Fatalf("count jobs: %v", err)
-	}
-	if unfinishedJobs != 0 {
-		t.Errorf("%d jobs did not complete, want both completed", unfinishedJobs)
 	}
 }

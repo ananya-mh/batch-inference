@@ -1,15 +1,20 @@
 // This file finishes things: requests whose jobs died without a result, and
-// batches whose requests are all done.
+// batches whose requests are all done (finalizing, then completed with their
+// results and errors files).
 package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
+	"github.com/ananya-mh/batch-inference/internal/database"
 	"github.com/ananya-mh/batch-inference/internal/requests"
+	"github.com/ananya-mh/batch-inference/internal/results"
 )
 
 // giveUpOnAbandonedRequests fails in-flight requests whose River job has
@@ -88,11 +93,11 @@ func startFinalizingDoneBatches(ctx context.Context, tx pgx.Tx) (int, error) {
 	return len(batchIDs), nil
 }
 
-// completeFinalizingBatches moves finalizing batches to completed, and
-// returns how many it moved. Writing the results and errors files will be
-// added here with Progress item 6.
-func completeFinalizingBatches(ctx context.Context, tx pgx.Tx) (int, error) {
-	rows, err := tx.Query(ctx, "SELECT id FROM batches WHERE status = $1", batches.StatusFinalizing)
+// completeFinalizingBatches writes the files of every finalizing batch and
+// moves it to completed, one batch per transaction, and returns how many it
+// completed.
+func completeFinalizingBatches(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	rows, err := pool.Query(ctx, "SELECT id FROM batches WHERE status = $1 ORDER BY finalizing_at", batches.StatusFinalizing)
 	if err != nil {
 		return 0, fmt.Errorf("find finalizing batches: %w", err)
 	}
@@ -101,10 +106,62 @@ func completeFinalizingBatches(ctx context.Context, tx pgx.Tx) (int, error) {
 		return 0, fmt.Errorf("read finalizing batches: %w", err)
 	}
 
+	completed := 0
 	for _, batchID := range batchIDs {
-		if err := batches.Transition(ctx, tx, batchID, batches.StatusFinalizing, batches.StatusCompleted); err != nil {
-			return 0, err
+		done, err := completeBatch(ctx, pool, batchID)
+		if err != nil {
+			return completed, err
+		}
+		if done {
+			completed++
 		}
 	}
-	return len(batchIDs), nil
+	return completed, nil
+}
+
+// completeBatch writes one finalizing batch's results and errors files, sets
+// output_file_id and error_file_id, and moves it to completed, all in one
+// transaction. A crash at any point before the commit leaves no files behind
+// and the batch still finalizing, so the next pass simply does it again; the
+// files can never be written twice or half-written. It returns false if
+// another server is already completing this batch.
+func completeBatch(ctx context.Context, pool *pgxpool.Pool, batchID string) (bool, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin completing %s: %w", batchID, err)
+	}
+	defer database.RollbackUnlessCommitted(ctx, tx)
+
+	// Lock the batch row. SKIP LOCKED: if another server is completing this
+	// batch right now, leave it to them rather than waiting.
+	var lockedID string
+	err = tx.QueryRow(ctx,
+		"SELECT id FROM batches WHERE id = $1 AND status = $2 FOR UPDATE SKIP LOCKED",
+		batchID, batches.StatusFinalizing,
+	).Scan(&lockedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock batch %s: %w", batchID, err)
+	}
+
+	outputFileID, errorFileID, err := results.WriteFiles(ctx, tx, batchID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx,
+		"UPDATE batches SET output_file_id = $2, error_file_id = $3 WHERE id = $1",
+		batchID, outputFileID, errorFileID,
+	); err != nil {
+		return false, fmt.Errorf("record files of batch %s: %w", batchID, err)
+	}
+	if err := batches.Transition(ctx, tx, batchID, batches.StatusFinalizing, batches.StatusCompleted); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit completing %s: %w", batchID, err)
+	}
+	return true, nil
 }

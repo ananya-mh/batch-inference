@@ -1,7 +1,9 @@
 // Package scheduler feeds batch requests into River a few at a time. Each pass
-// fans out new batches into requests, gives up on requests whose jobs died,
-// admits pending requests into free slots of the window, and finishes
-// batches that are done. See "Fan-out and fair scheduling" in DESIGN.md.
+// writes the files of batches that are finalizing, then (under a lock) fans
+// out new batches into requests, gives up on requests whose jobs died,
+// admits pending requests into free slots of the window, and marks batches
+// whose requests are all done as finalizing. See "Fan-out and fair
+// scheduling" in DESIGN.md.
 package scheduler
 
 import (
@@ -87,17 +89,35 @@ type PassResult struct {
 	GaveUp     int  // requests failed because their job ended without a result
 	Admitted   int  // requests given a River job
 	Finalizing int  // batches moved to finalizing
-	Completed  int  // batches moved to completed
+	Completed  int  // batches moved to completed, with their files written
 }
 
-// RunPass runs one scheduling pass in a single transaction, so a pass either
-// happens completely or not at all.
+// RunPass runs one scheduling pass.
+//
+// Finalizing batches are completed first, each in its own transaction and
+// outside the scheduler lock: writing a 50,000-line results file takes a
+// moment, and admitting other tenants' requests should not wait for it.
+// Running it first also means a batch spends at least one pass in
+// finalizing, so clients can see that status.
 func (s *Scheduler) RunPass(ctx context.Context) (PassResult, error) {
 	var result PassResult
+	var err error
 
+	if result.Completed, err = completeFinalizingBatches(ctx, s.pool); err != nil {
+		return result, err
+	}
+	if err := s.runLockedPass(ctx, &result); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+// runLockedPass does the rest of a pass in a single transaction, under the
+// scheduler lock, so it happens completely or not at all.
+func (s *Scheduler) runLockedPass(ctx context.Context, result *PassResult) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return result, fmt.Errorf("begin scheduler pass: %w", err)
+		return fmt.Errorf("begin scheduler pass: %w", err)
 	}
 	defer database.RollbackUnlessCommitted(ctx, tx)
 
@@ -106,34 +126,30 @@ func (s *Scheduler) RunPass(ctx context.Context) (PassResult, error) {
 	// held until this transaction ends. If another server holds it, skip.
 	var locked bool
 	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1)", schedulerLockID).Scan(&locked); err != nil {
-		return result, fmt.Errorf("take scheduler lock: %w", err)
+		return fmt.Errorf("take scheduler lock: %w", err)
 	}
 	if !locked {
 		result.Skipped = true
-		return result, nil
+		return nil
 	}
 
 	if result.FannedOut, err = fanOut(ctx, tx); err != nil {
-		return result, err
+		return err
 	}
 	// Giving up on dead jobs before admitting frees their slots for this pass.
 	if result.GaveUp, err = giveUpOnAbandonedRequests(ctx, tx); err != nil {
-		return result, err
+		return err
 	}
 	if result.Admitted, err = s.admit(ctx, tx); err != nil {
-		return result, err
-	}
-	// Completing before starting to finalize means a batch spends at least
-	// one pass in finalizing, so the status is visible to clients.
-	if result.Completed, err = completeFinalizingBatches(ctx, tx); err != nil {
-		return result, err
+		return err
 	}
 	if result.Finalizing, err = startFinalizingDoneBatches(ctx, tx); err != nil {
-		return result, err
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return PassResult{}, fmt.Errorf("commit scheduler pass: %w", err)
+		*result = PassResult{Completed: result.Completed}
+		return fmt.Errorf("commit scheduler pass: %w", err)
 	}
-	return result, nil
+	return nil
 }

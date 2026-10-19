@@ -5,6 +5,7 @@ package scheduler_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/model"
+	"github.com/ananya-mh/batch-inference/internal/results"
 	"github.com/ananya-mh/batch-inference/internal/scheduler"
 	"github.com/ananya-mh/batch-inference/internal/testdb"
 	"github.com/ananya-mh/batch-inference/internal/testfixtures"
@@ -237,6 +239,132 @@ func TestFinishedBatchIsFinalizedThenCompleted(t *testing.T) {
 	if status := testfixtures.BatchStatus(t, pool, batch.ID); status != batches.StatusCompleted {
 		t.Errorf("status = %s, want completed", status)
 	}
+}
+
+// TestFinishedBatchGetsItsFiles checks completing a batch writes its files
+// and sets output_file_id, with error_file_id left null when nothing failed.
+func TestFinishedBatchGetsItsFiles(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 3)
+	s := newScheduler(t, pool, 4)
+	runPass(t, s)
+	finishQueued(t, pool, 3)
+	runPass(t, s) // to finalizing
+	runPass(t, s) // to completed
+
+	got, err := batches.Get(context.Background(), pool, "tenant_a", batch.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != batches.StatusCompleted || got.OutputFileID == nil || got.ErrorFileID != nil {
+		t.Errorf("batch = status %s, output %v, error %v; want completed with only an output file",
+			got.Status, got.OutputFileID, got.ErrorFileID)
+	}
+}
+
+// TestFinalizingSurvivesCrash kills the database connection in the middle of
+// completing a batch, after its files were written but before the commit, as
+// a server crash would. Nothing may be left behind, and the next pass must
+// produce exactly the same files, with no duplicate or missing lines.
+func TestFinalizingSurvivesCrash(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	ctx := context.Background()
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 50)
+	s := newScheduler(t, pool, 50)
+	runPass(t, s)
+	finishQueued(t, pool, 40)
+	// The other 10 fail, so both files are involved.
+	if _, err := pool.Exec(ctx, `
+		WITH failed AS (
+			UPDATE requests SET status = 'failed' WHERE status = 'queued' RETURNING batch_id, custom_id
+		)
+		INSERT INTO results (batch_id, custom_id, succeeded, error_code, error_message)
+		SELECT batch_id, custom_id, false, 'retries_exhausted', 'it went wrong' FROM failed`); err != nil {
+		t.Fatalf("fail requests: %v", err)
+	}
+	runPass(t, s) // to finalizing
+	if status := testfixtures.BatchStatus(t, pool, batch.ID); status != batches.StatusFinalizing {
+		t.Fatalf("status = %s, want finalizing", status)
+	}
+
+	// Write the files in a transaction, and note what they contain.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	var backendPID int
+	if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&backendPID); err != nil {
+		t.Fatalf("get backend pid: %v", err)
+	}
+	if _, _, err := results.WriteFiles(ctx, tx, batch.ID); err != nil {
+		t.Fatalf("WriteFiles: %v", err)
+	}
+	beforeCrash := fileLines(t, tx, batch.ID)
+
+	// Crash: the connection dies before the commit.
+	if _, err := pool.Exec(ctx, "SELECT pg_terminate_backend($1)", backendPID); err != nil {
+		t.Fatalf("terminate backend: %v", err)
+	}
+	if err := tx.Commit(ctx); err == nil {
+		t.Fatal("commit succeeded on a terminated connection")
+	}
+
+	var leftOver int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM files WHERE purpose IN ('batch_output', 'batch_error')").Scan(&leftOver); err != nil {
+		t.Fatalf("count files: %v", err)
+	}
+	if leftOver != 0 {
+		t.Errorf("%d result files survived the crash, want 0", leftOver)
+	}
+	if status := testfixtures.BatchStatus(t, pool, batch.ID); status != batches.StatusFinalizing {
+		t.Errorf("status after crash = %s, want still finalizing", status)
+	}
+
+	// The restart: the next pass completes the batch.
+	if result := runPass(t, s); result.Completed != 1 {
+		t.Fatalf("pass after crash = %+v, want 1 completed", result)
+	}
+	afterRestart := fileLines(t, pool, batch.ID)
+	if strings.Join(afterRestart, "\n") != strings.Join(beforeCrash, "\n") {
+		t.Errorf("files after restart differ from the files written before the crash")
+	}
+	if len(afterRestart) != 50 {
+		t.Errorf("%d lines across both files, want 50 (one per request)", len(afterRestart))
+	}
+	unique := map[string]bool{}
+	for _, line := range afterRestart {
+		unique[line] = true
+	}
+	if len(unique) != 50 {
+		t.Errorf("%d distinct lines, want 50 (no duplicates)", len(unique))
+	}
+}
+
+// querier is anything that can run a query: a pool or a transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// fileLines returns every line of the batch's results and errors files,
+// results file first, each in line order.
+func fileLines(t *testing.T, db querier, batchID string) []string {
+	t.Helper()
+	rows, err := db.Query(context.Background(), `
+		SELECT l.line
+		FROM file_lines l
+		JOIN files f ON f.id = l.file_id
+		WHERE f.filename LIKE $1 || '%'
+		ORDER BY f.purpose DESC, l.line_number`, batchID)
+	if err != nil {
+		t.Fatalf("query file lines: %v", err)
+	}
+	lines, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("read file lines: %v", err)
+	}
+	return lines
 }
 
 // TestTwoSchedulersNeverOverfillWindow runs two schedulers (as two servers
