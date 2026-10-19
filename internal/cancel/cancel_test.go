@@ -434,3 +434,38 @@ func TestCancelAndFanOutRace(t *testing.T) {
 	}
 	t.Logf("outcomes over 20 rounds: %v", outcomes)
 }
+
+// TestCancelCatchesRequestWhoseFailureRiverHasNotRecorded covers a narrow race:
+// a worker's attempt failed and it returned the error for a retry, setting
+// the request back to queued, but River has not recorded the failure yet, so
+// River still shows the job as running. Cancel must cancel that request (and
+// mark its job so River cancels it instead of retrying), rather than leave it
+// as if it were mid-call; otherwise the batch waits out the retry delay.
+func TestCancelCatchesRequestWhoseFailureRiverHasNotRecorded(t *testing.T) {
+	t.Parallel()
+	pool, riverClient, s := setup(t, 5)
+	ctx := context.Background()
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 2)
+	runPass(t, s)
+	// a-0: failed, waiting for its retry; River still says running.
+	exec(t, pool, "UPDATE river_job SET state = 'running', attempt = 1, attempted_at = now() WHERE args->>'custom_id' = 'a-0'")
+	// a-1: genuinely mid-call.
+	exec(t, pool, "UPDATE requests SET status = 'running' WHERE custom_id = 'a-1'")
+	exec(t, pool, "UPDATE river_job SET state = 'running', attempt = 1, attempted_at = now() WHERE args->>'custom_id' = 'a-1'")
+
+	if _, err := cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID); err != nil {
+		t.Fatalf("cancel.Batch: %v", err)
+	}
+
+	statuses := requestStatuses(t, pool, batch.ID)
+	if statuses["a-0"] != "cancelled" || statuses["a-1"] != "running" {
+		t.Errorf("statuses = %v, want a-0 cancelled (waiting for a retry) and a-1 still running (mid-call)", statuses)
+	}
+	var cancelAttempted bool
+	if err := pool.QueryRow(ctx, "SELECT metadata ? 'cancel_attempted_at' FROM river_job WHERE args->>'custom_id' = 'a-0'").Scan(&cancelAttempted); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if !cancelAttempted {
+		t.Error("a-0's job was not marked for cancellation, so River would retry it")
+	}
+}

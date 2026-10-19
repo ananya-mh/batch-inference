@@ -165,7 +165,7 @@ func newDatabaseCollector(pool *pgxpool.Pool) *databaseCollector {
 			"Requests holding a slot in the window (queued in River or running, including waiting for a retry), per tenant.",
 			[]string{"tenant"}, nil),
 		waitingRetry: prometheus.NewDesc("batch_requests_waiting_for_retry",
-			"In-flight requests whose last attempt failed and that are waiting out the retry delay, per tenant.",
+			"In-flight requests whose last attempt failed and that are waiting out the retry delay, per tenant (River jobs in the retryable or scheduled state).",
 			[]string{"tenant"}, nil),
 	}
 }
@@ -190,7 +190,7 @@ func (c *databaseCollector) Collect(values chan<- prometheus.Metric) {
 		       count(*) FILTER (WHERE r.status IN ('queued', 'running')),
 		       count(*) FILTER (WHERE j.state IN ('retryable', 'scheduled'))
 		FROM requests r
-		LEFT JOIN river_job j ON j.id = r.river_job_id AND r.status = 'running'
+		LEFT JOIN river_job j ON j.id = r.river_job_id
 		WHERE r.status IN ('pending', 'queued', 'running')
 		GROUP BY r.tenant_id`)
 	if err != nil {

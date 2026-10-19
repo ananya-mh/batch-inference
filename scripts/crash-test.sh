@@ -42,8 +42,10 @@ compose_test() {
 }
 
 # Runs one SQL query against the service's database and prints the result.
+# Its input is /dev/null: "docker compose exec" would otherwise read the
+# caller's input, which inside a "while read" loop swallows the loop's lines.
 sql() {
-	docker compose exec -T postgres psql -U postgres -d batch -Atc "$1"
+	docker compose exec -T postgres psql -U postgres -d batch -Atc "$1" </dev/null
 }
 
 # Prints a string field from compact JSON on stdin, like "id".
@@ -130,6 +132,9 @@ fi
 step "Restarting the server"
 compose_test up -d --wait server >/dev/null 2>&1
 RESTARTED_AT=$(date +%s)
+# When the restarted server process started, by the Docker VM's clock, which
+# the database shares. Read now: cleanup restarts the server again at the end.
+SERVER_STARTED=$(curl -sf "$API/metrics" | awk '$1 == "process_start_time_seconds" { print $2 }')
 
 step "Waiting for the batch to be $TARGET"
 STATUS=""
@@ -168,6 +173,7 @@ if [ "$MODE" = expiry ]; then
 	SAVED_LATE=$(sql "SELECT count(*) FROM requests r JOIN batches b ON b.id = r.batch_id WHERE b.id = '$BATCH_ID' AND r.status IN ('succeeded', 'failed') AND r.finished_at >= b.expires_at")
 	EXPIRED_LINES=$(sql "SELECT count(*) FROM file_lines l JOIN batches b ON l.file_id = b.error_file_id WHERE b.id = '$BATCH_ID' AND l.line LIKE '%batch_expired%'")
 	EXPIRED_AFTER_DEADLINE=$(sql "SELECT round(extract(epoch FROM expired_at - expires_at)::numeric, 1) FROM batches WHERE id = '$BATCH_ID'")
+	EXPIRED_AFTER_START=$(sql "SELECT round((extract(epoch FROM expired_at) - $SERVER_STARTED)::numeric, 2) FROM batches WHERE id = '$BATCH_ID'")
 	check "every request finished before the deadline or expired ($SUCCEEDED + $FAILED + $EXPIRED)" \
 		"$([ $((SUCCEEDED + FAILED + EXPIRED)) -eq "$LINES" ] && [ "$EXPIRED" -gt 0 ] && echo true)"
 	check "no result saved after the deadline was kept ($SAVED_LATE)" "$([ "$SAVED_LATE" -eq 0 ] && echo true)"
@@ -194,6 +200,7 @@ if [ "$MODE" = expiry ]; then
  Expired:                   $EXPIRED
  Server down past deadline: ${DOWN_AFTER_DEADLINE}s
  Expired after restart:     ${RECOVERY_SECONDS}s (${EXPIRED_AFTER_DEADLINE}s after the deadline)
+ Expired after server start: ${EXPIRED_AFTER_START}s
 EOF
 else
 	echo " Finished after restart:    ${RECOVERY_SECONDS}s"

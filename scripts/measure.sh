@@ -41,8 +41,10 @@ step() {
 }
 
 # Runs one SQL query against the service's database and prints the result.
+# Its input is /dev/null: "docker compose exec" would otherwise read the
+# caller's input, which inside a "while read" loop swallows the loop's lines.
 sql() {
-	docker compose exec -T postgres psql -U postgres -d batch -Atc "$1"
+	docker compose exec -T postgres psql -U postgres -d batch -Atc "$1" </dev/null
 }
 
 # Prints a string field from compact JSON on stdin, like "id".
@@ -167,7 +169,7 @@ if echo "$SECTIONS" | grep -qw upload; then
 		echo "upload $i: ${TIME}s, server memory $(awk -v b="$BASELINE" 'BEGIN { printf "%.0f", b / 1048576 }') MiB before, peak $(awk -v p="$PEAK" 'BEGIN { printf "%.0f", p / 1048576 }') MiB" | tee -a "$OUT/upload.txt"
 		echo "$TIME $PEAK" >>"$WORK/uploads.txt"
 	done
-	read -r T_MED T_MIN T_MAX <<<"$(awk '{ print $1 }' "$WORK/uploads.txt" | median_range)"
+	read -r T_MED T_MIN T_MAX <<<"$(awk '{ printf "%.2f\n", $1 }' "$WORK/uploads.txt" | median_range)"
 	PEAK_MAX=$(awk '{ print $2 }' "$WORK/uploads.txt" | sort -g | tail -1)
 	row "Upload a ${SIZE_MB} MB, 440,000-line file (checked line by line as it streams in)" \
 		"${T_MED} s median [${T_MIN}–${T_MAX}], $(awk -v s="$SIZE_MB" -v t="$T_MED" 'BEGIN { printf "%.0f", s / t }') MB/s; server memory peaked at $(awk -v p="$PEAK_MAX" 'BEGIN { printf "%.0f", p / 1048576 }') MiB" \
@@ -239,7 +241,7 @@ if echo "$SECTIONS" | grep -qw cancel; then
 		echo "run $i: cancel call ${CALL}s, cancelled ${TOOK}s after cancelling, $RUNNING were mid-call" | tee -a "$OUT/cancel.txt"
 		echo "$TOOK $CALL $RUNNING" >>"$WORK/cancel.txt"
 	done
-	read -r C_MED C_MIN C_MAX <<<"$(awk '{ print $1 }' "$WORK/cancel.txt" | median_range)"
+	read -r C_MED C_MIN C_MAX <<<"$(awk '{ printf "%.2f\n", $1 }' "$WORK/cancel.txt" | median_range)"
 	read -r CALL_MED _ _ <<<"$(awk '{ print $2 }' "$WORK/cancel.txt" | median_range)"
 	read -r R_MED R_MIN R_MAX <<<"$(awk '{ print $3 }' "$WORK/cancel.txt" | median_range)"
 	row "Cancel → \`cancelled\`, window of 32 full, fake model 50–500 ms" \
@@ -273,12 +275,9 @@ if echo "$SECTIONS" | grep -qw overdue; then
 	for i in 1 2 3; do
 		scripts/crash-test.sh --expiry 500 >"$WORK/crash.out" 2>&1 || { cat "$WORK/crash.out"; exit 1; }
 		cp "$WORK/crash.out" "$OUT/overdue-run-$i.txt"
-		# The last expired batch is the crash test's. Measure from the
-		# restarted server's start, by the Docker VM's clock, which the
-		# database and server share.
-		BATCH=$(sql "SELECT id FROM batches WHERE status = 'expired' ORDER BY expired_at DESC LIMIT 1")
-		START=$(metric process_start_time_seconds)
-		TOOK=$(sql "SELECT round((extract(epoch FROM expired_at) - $START)::numeric, 2) FROM batches WHERE id = '$BATCH'")
+		# The crash test measures from the restarted server's own start (its
+		# cleanup restarts the server again, so it can't be read afterwards).
+		TOOK=$(awk -F': *' '/Expired after server start:/ { sub(/s$/, "", $2); print $2 }' "$WORK/crash.out")
 		echo "run $i: the overdue batch expired ${TOOK}s after the restarted server started" | tee -a "$OUT/overdue.txt"
 		echo "$TOOK" >>"$WORK/overdue.txt"
 	done
@@ -292,8 +291,11 @@ step "Machine"
 CHIP=$( (sysctl -n machdep.cpu.brand_string 2>/dev/null || grep -m1 'model name' /proc/cpuinfo | cut -d: -f2) | sed 's/^ *//')
 CORES=$( (sysctl -n hw.ncpu 2>/dev/null || nproc) )
 RAM_GB=$( (sysctl -n hw.memsize 2>/dev/null || awk '/MemTotal/ { print $2 * 1024 }' /proc/meminfo) | awk '{ printf "%.0f", $1 / 1073741824 }')
-OS=$( (sw_vers -productName 2>/dev/null && sw_vers -productVersion 2>/dev/null) | tr '\n' ' ' || uname -sr)
-[ -n "$OS" ] || OS=$(uname -sr)
+if command -v sw_vers >/dev/null; then
+	OS="$(sw_vers -productName) $(sw_vers -productVersion)"
+else
+	OS=$(uname -sr)
+fi
 DOCKER_CPUS=$(docker info --format '{{.NCPU}}')
 DOCKER_MEM_GB=$(docker info --format '{{.MemTotal}}' | awk '{ printf "%.1f", $1 / 1073741824 }')
 DOCKER_VERSION=$(docker info --format '{{.ServerVersion}}')

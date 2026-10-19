@@ -21,7 +21,7 @@ type Status string
 // The request statuses. "In flight" means queued or running.
 const (
 	StatusPending   Status = "pending"   // waiting in our table, no River job yet
-	StatusQueued    Status = "queued"    // has a River job, not started
+	StatusQueued    Status = "queued"    // has a River job; not started, or waiting for a retry
 	StatusRunning   Status = "running"   // a worker passed the start check
 	StatusSucceeded Status = "succeeded" // final: has a successful result
 	StatusFailed    Status = "failed"    // final: has a failed result
@@ -150,19 +150,34 @@ func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (StartResul
 	return result, nil
 }
 
-// CancelIfBatchCancelling cancels the request if its batch is cancelling and
-// the request has not finished, and reports whether it did. Workers call it when an attempt fails: a
-// request whose batch is being cancelled should not wait for a retry, since
-// that would only hold up the cancel.
-func CancelIfBatchCancelling(ctx context.Context, tx pgx.Tx, batchID, customID string) (bool, error) {
+// PrepareRetry is called by a worker when an attempt failed and should be
+// tried again. If the batch is cancelling, it cancels the request instead and
+// reports cancelled = true: waiting for a retry would only hold up the
+// cancel. Otherwise it moves the request from running back to queued,
+// meaning "waiting for its next attempt".
+//
+// Marking the request queued here, in our own table, matters because River
+// records a failed attempt a moment after the worker returns. A cancel that
+// lands in that moment would see the job as still running and leave it to
+// finish; seeing the request queued, it cancels it (see "Bugs found").
+func PrepareRetry(ctx context.Context, tx pgx.Tx, batchID, customID string) (cancelled bool, err error) {
 	var batchStatus batches.Status
 	if err := tx.QueryRow(ctx, "SELECT status FROM batches WHERE id = $1", batchID).Scan(&batchStatus); err != nil {
 		return false, fmt.Errorf("read batch %s status: %w", batchID, err)
 	}
-	if batchStatus != batches.StatusCancelling {
-		return false, nil
+	if batchStatus == batches.StatusCancelling {
+		return cancelRequest(ctx, tx, batchID, customID)
 	}
-	return cancelRequest(ctx, tx, batchID, customID)
+
+	_, err = tx.Exec(ctx, `
+		UPDATE requests SET status = $3
+		WHERE batch_id = $1 AND custom_id = $2 AND status = $4`,
+		batchID, customID, StatusQueued, StatusRunning,
+	)
+	if err != nil {
+		return false, fmt.Errorf("queue request %s/%s for a retry: %w", batchID, customID, err)
+	}
+	return false, nil
 }
 
 // cancelRequest marks a request cancelled if it has not finished yet, and

@@ -46,8 +46,10 @@ step() {
 }
 
 # Runs one SQL query against the service's database and prints the result.
+# Its input is /dev/null: "docker compose exec" would otherwise read the
+# caller's input, which inside a "while read" loop swallows the loop's lines.
 sql() {
-	docker compose exec -T postgres psql -U postgres -d batch -Atc "$1"
+	docker compose exec -T postgres psql -U postgres -d batch -Atc "$1" </dev/null
 }
 
 # Prints a string field from compact JSON on stdin, like "id".

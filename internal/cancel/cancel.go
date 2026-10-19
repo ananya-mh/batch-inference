@@ -111,10 +111,11 @@ func cancelInTx(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Clie
 }
 
 // cancelUnstartedRequests cancels every request of the batch that is not
-// running right now: waiting ones (no River job yet), queued ones, and ones
-// waiting for a retry. Queued and retrying ones also get their River job
-// cancelled, so it never runs again. Only requests whose job is running at
-// this moment are left to finish. It returns how many requests it cancelled.
+// running right now: waiting ones (no River job yet), queued ones (including
+// ones waiting for a retry), and running ones whose job is no longer running
+// (an earlier attempt's worker crashed). Those with a River job also get it
+// cancelled, so it never runs again. Only requests mid-call are left to
+// finish. It returns how many requests it cancelled.
 func cancelUnstartedRequests(ctx context.Context, tx pgx.Tx, riverClient *river.Client[pgx.Tx], batchID string) (int, error) {
 	waiting, err := tx.Exec(ctx, `
 		UPDATE requests SET status = $2, finished_at = clock_timestamp()
@@ -126,15 +127,16 @@ func cancelUnstartedRequests(ctx context.Context, tx pgx.Tx, riverClient *river.
 	}
 	cancelled := int(waiting.RowsAffected())
 
-	// A request waiting for a retry is still "running" in our table, but its
-	// River job is retryable, not running, so it is cancelled here too.
+	// Queued requests are cancelled whatever River shows for their job: a
+	// worker sets a failed request back to queued before River records the
+	// failure, so River may still show the job as running for a moment.
 	rows, err := tx.Query(ctx, `
 		SELECT r.custom_id, r.river_job_id
 		FROM requests r
 		JOIN river_job j ON j.id = r.river_job_id
 		WHERE r.batch_id = $1
-		  AND r.status IN ($2, $3)
-		  AND j.state IN ('available', 'scheduled', 'retryable')`,
+		  AND (r.status = $2
+		       OR (r.status = $3 AND j.state IN ('available', 'scheduled', 'retryable')))`,
 		batchID, requests.StatusQueued, requests.StatusRunning,
 	)
 	if err != nil {
@@ -161,9 +163,10 @@ func cancelUnstartedRequests(ctx context.Context, tx pgx.Tx, riverClient *river.
 			return 0, fmt.Errorf("cancel request %s: %w", request.CustomID, err)
 		}
 		cancelled += int(tag.RowsAffected())
-		// If River fetched the job a moment ago, this only signals the
-		// worker; its start check then waits for this transaction and sees
-		// the batch is cancelling, so the model is still never called.
+		// If River shows the job as running (it was fetched a moment ago, or
+		// its failure is not recorded yet), this marks it for cancellation:
+		// a start check then sees the batch is cancelling, and a failed
+		// attempt ends cancelled instead of being retried.
 		if _, err := riverClient.JobCancelTx(ctx, tx, request.JobID); err != nil {
 			return 0, fmt.Errorf("cancel job of %s: %w", request.CustomID, err)
 		}

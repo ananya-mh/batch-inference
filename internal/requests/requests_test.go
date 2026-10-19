@@ -318,3 +318,50 @@ func TestFinishRefusesAfterDeadline(t *testing.T) {
 		t.Errorf("%d results saved after the deadline, want 0", count)
 	}
 }
+
+// TestPrepareRetryQueuesRequestAgain checks a failed attempt that will be
+// retried moves the request back to queued (waiting for its next attempt).
+func TestPrepareRetryQueuesRequestAgain(t *testing.T) {
+	t.Parallel()
+	pool, batchID := setupQueuedRequest(t)
+	ctx := context.Background()
+	inTx(t, pool, func(tx pgx.Tx) {
+		if _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	})
+
+	inTx(t, pool, func(tx pgx.Tx) {
+		if cancelled, err := requests.PrepareRetry(ctx, tx, batchID, "r-0"); err != nil || cancelled {
+			t.Errorf("PrepareRetry = cancelled %v, err %v; want queued again", cancelled, err)
+		}
+	})
+	if status := requestStatus(t, pool, batchID); status != requests.StatusQueued {
+		t.Errorf("status = %s, want queued", status)
+	}
+}
+
+// TestPrepareRetryCancelsWhenBatchIsCancelling checks a failed attempt of a
+// cancelling batch is cancelled instead of waiting for a retry.
+func TestPrepareRetryCancelsWhenBatchIsCancelling(t *testing.T) {
+	t.Parallel()
+	pool, batchID := setupQueuedRequest(t)
+	ctx := context.Background()
+	inTx(t, pool, func(tx pgx.Tx) {
+		if _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	})
+	if err := batches.Transition(ctx, pool, batchID, batches.StatusInProgress, batches.StatusCancelling); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	inTx(t, pool, func(tx pgx.Tx) {
+		if cancelled, err := requests.PrepareRetry(ctx, tx, batchID, "r-0"); err != nil || !cancelled {
+			t.Errorf("PrepareRetry = cancelled %v, err %v; want cancelled", cancelled, err)
+		}
+	})
+	if status := requestStatus(t, pool, batchID); status != requests.StatusCancelled {
+		t.Errorf("status = %s, want cancelled", status)
+	}
+}
