@@ -15,6 +15,7 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
 	"github.com/ananya-mh/batch-inference/internal/database"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/model"
 	"github.com/ananya-mh/batch-inference/internal/requests"
 )
@@ -55,6 +56,7 @@ type Worker struct {
 
 	pool           *pgxpool.Pool
 	model          *model.Client
+	metrics        *metrics.Metrics
 	retryBaseDelay time.Duration
 
 	// afterFinish is called after a request's result is saved; the server
@@ -63,16 +65,18 @@ type Worker struct {
 }
 
 // NewRiverClient returns a River client whose workers run requests against
-// modelClient. afterFinish is called each time a worker saves a result. The
-// client is not started; call Start on it to begin working.
-func NewRiverClient(pool *pgxpool.Pool, modelClient *model.Client, config Config, afterFinish func()) (*river.Client[pgx.Tx], error) {
+// modelClient and report to m. afterFinish is called each time a worker saves
+// a result. The client is not started; call Start on it to begin working.
+func NewRiverClient(pool *pgxpool.Pool, modelClient *model.Client, config Config, m *metrics.Metrics, afterFinish func()) (*river.Client[pgx.Tx], error) {
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &Worker{
 		pool:           pool,
 		model:          modelClient,
+		metrics:        m,
 		retryBaseDelay: config.RetryBaseDelay,
 		afterFinish:    afterFinish,
 	})
+	m.WorkersTotal.Set(float64(config.Workers))
 
 	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Queues:               map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: config.Workers}},
@@ -89,17 +93,30 @@ func NewRiverClient(pool *pgxpool.Pool, modelClient *model.Client, config Config
 
 // Work runs one attempt of one request.
 func (w *Worker) Work(ctx context.Context, job *river.Job[requests.RunArgs]) error {
-	body, started, err := w.start(ctx, job.Args)
+	w.metrics.WorkersBusy.Inc()
+	defer w.metrics.WorkersBusy.Dec()
+
+	started, err := w.start(ctx, job.Args)
 	if err != nil {
 		return err
 	}
-	if !started {
+	if started.Cancelled {
+		w.metrics.RequestOutcomes.WithLabelValues(started.TenantID, metrics.OutcomeCancelled).Inc()
+	}
+	if !started.Started {
 		// The batch is no longer in progress, or the request already
 		// finished. Not calling the model is the point; the job is done.
 		return nil
 	}
+	// The wait is how long the request waited before its first try; later
+	// attempts would count the retry delays as waiting.
+	if job.Attempt == 1 {
+		w.metrics.RequestWaitSeconds.WithLabelValues(started.TenantID).Observe(started.Waited.Seconds())
+	}
 
-	reply, callErr := w.model.Complete(ctx, body)
+	callStart := time.Now()
+	reply, callErr := w.model.Complete(ctx, started.Body)
+	w.observeModelCall(time.Since(callStart), callErr)
 	// If the job's own context was cancelled (not timed out), this server is
 	// shutting down, or River was asked to cancel the job. Either way the
 	// request did not fail. Snoozing for zero seconds hands the job back to
@@ -113,7 +130,7 @@ func (w *Worker) Work(ctx context.Context, job *river.Job[requests.RunArgs]) err
 	}
 	outcome, retry := decideOutcome(reply, callErr, job.Attempt, job.MaxAttempts)
 	if !retry {
-		return w.finish(ctx, job, outcome)
+		return w.finish(ctx, job, started.TenantID, outcome)
 	}
 
 	// If the batch was cancelled while this attempt ran, don't wait for a
@@ -125,10 +142,21 @@ func (w *Worker) Work(ctx context.Context, job *river.Job[requests.RunArgs]) err
 		return err
 	}
 	if cancelled {
+		w.metrics.RequestOutcomes.WithLabelValues(started.TenantID, metrics.OutcomeCancelled).Inc()
 		return nil
 	}
 	// Returning the error makes River try again after NextRetry.
+	w.metrics.RequestOutcomes.WithLabelValues(started.TenantID, metrics.OutcomeRetried).Inc()
 	return callErr
+}
+
+// observeModelCall records how long a model call took and whether it worked.
+func (w *Worker) observeModelCall(took time.Duration, callErr error) {
+	outcome := metrics.CallSucceeded
+	if callErr != nil {
+		outcome = metrics.CallFailed
+	}
+	w.metrics.ModelCallSeconds.WithLabelValues(outcome).Observe(took.Seconds())
 }
 
 // cancelIfBatchCancelling cancels the request and completes its job, in one
@@ -159,21 +187,21 @@ func (w *Worker) cancelIfBatchCancelling(workCtx context.Context, job *river.Job
 
 // start runs the start check in its own short transaction, so the batch row
 // is locked only briefly and never during the model call.
-func (w *Worker) start(ctx context.Context, args requests.RunArgs) ([]byte, bool, error) {
+func (w *Worker) start(ctx context.Context, args requests.RunArgs) (requests.StartResult, error) {
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
-		return nil, false, fmt.Errorf("begin start check: %w", err)
+		return requests.StartResult{}, fmt.Errorf("begin start check: %w", err)
 	}
 	defer database.RollbackUnlessCommitted(ctx, tx)
 
-	body, started, err := requests.Start(ctx, tx, args.BatchID, args.CustomID)
+	result, err := requests.Start(ctx, tx, args.BatchID, args.CustomID)
 	if err != nil {
-		return nil, false, err
+		return requests.StartResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, false, fmt.Errorf("commit start check: %w", err)
+		return requests.StartResult{}, fmt.Errorf("commit start check: %w", err)
 	}
-	return body, started, nil
+	return result, nil
 }
 
 // decideOutcome turns a model call's result into either a final outcome to
@@ -200,7 +228,7 @@ func decideOutcome(reply []byte, callErr error, attempt, maxAttempts int) (outco
 
 // finish saves the outcome and marks the River job complete in one
 // transaction, so either both happen or neither does.
-func (w *Worker) finish(workCtx context.Context, job *river.Job[requests.RunArgs], outcome requests.Outcome) error {
+func (w *Worker) finish(workCtx context.Context, job *river.Job[requests.RunArgs], tenantID string, outcome requests.Outcome) error {
 	// WithoutCancel keeps the job's context values but drops its deadline.
 	// The values matter: JobCompleteTx finds the River client through them.
 	// (An earlier version used context.Background() here, and every save
@@ -216,7 +244,8 @@ func (w *Worker) finish(workCtx context.Context, job *river.Job[requests.RunArgs
 
 	// saved is false if another attempt already finished this request, or
 	// it expired. Then there is nothing to save, but the job is still done.
-	if _, err := requests.Finish(ctx, tx, job.Args.BatchID, job.Args.CustomID, outcome); err != nil {
+	saved, err := requests.Finish(ctx, tx, job.Args.BatchID, job.Args.CustomID, outcome)
+	if err != nil {
 		return err
 	}
 	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
@@ -226,6 +255,15 @@ func (w *Worker) finish(workCtx context.Context, job *river.Job[requests.RunArgs
 		return fmt.Errorf("commit result: %w", err)
 	}
 
+	// Counted only after the commit, and only if this attempt's result was
+	// the one saved.
+	if saved {
+		result := metrics.OutcomeCompleted
+		if !outcome.Succeeded {
+			result = metrics.OutcomeFailed
+		}
+		w.metrics.RequestOutcomes.WithLabelValues(tenantID, result).Inc()
+	}
 	w.afterFinish()
 	return nil
 }

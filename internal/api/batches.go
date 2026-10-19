@@ -230,7 +230,7 @@ func (s *Server) handleGetBatch(w http.ResponseWriter, r *http.Request) {
 // Conflict with OpenAI's wording, which the OpenAI SDKs raise as a
 // ConflictError.
 func (s *Server) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
-	batch, err := cancel.Batch(r.Context(), s.pool, s.river, tenantIDFrom(r.Context()), r.PathValue("id"))
+	batch, err := cancel.Batch(r.Context(), s.pool, s.river, s.metrics, tenantIDFrom(r.Context()), r.PathValue("id"))
 	var notCancellable *cancel.NotCancellableError
 	switch {
 	case errors.Is(err, batches.ErrNotFound):

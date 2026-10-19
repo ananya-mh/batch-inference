@@ -62,7 +62,7 @@ func fanOutBatch(ctx context.Context, tx pgx.Tx, batchID string) (bool, error) {
 		return false, err
 	}
 
-	if err := requests.CreateForBatch(ctx, savepoint, batchID, requests.StatusPending); err != nil {
+	if _, err := requests.CreateForBatch(ctx, savepoint, batchID, requests.StatusPending); err != nil {
 		return false, err
 	}
 

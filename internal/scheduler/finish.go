@@ -13,6 +13,7 @@ import (
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/database"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/requests"
 	"github.com/ananya-mh/batch-inference/internal/results"
 )
@@ -24,9 +25,9 @@ import (
 // happens when the worker crashed (or panicked) on every attempt and River
 // gave up on the job. Without this, such a request would hold a slot forever
 // and its batch would never finish.
-func giveUpOnAbandonedRequests(ctx context.Context, tx pgx.Tx) (int, error) {
+func giveUpOnAbandonedRequests(ctx context.Context, tx pgx.Tx, tally metrics.Tally) (int, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT r.batch_id, r.custom_id, coalesce(j.state::text, 'missing')
+		SELECT r.batch_id, r.custom_id, r.tenant_id, coalesce(j.state::text, 'missing')
 		FROM requests r
 		LEFT JOIN river_job j ON j.id = r.river_job_id
 		WHERE r.status IN ($1, $2)
@@ -39,6 +40,7 @@ func giveUpOnAbandonedRequests(ctx context.Context, tx pgx.Tx) (int, error) {
 	type abandoned struct {
 		BatchID  string
 		CustomID string
+		TenantID string
 		JobState string
 	}
 	found, err := pgx.CollectRows(rows, pgx.RowToStructByPos[abandoned])
@@ -59,6 +61,7 @@ func giveUpOnAbandonedRequests(ctx context.Context, tx pgx.Tx) (int, error) {
 		}
 		if saved {
 			gaveUp++
+			tally.Add(request.TenantID, metrics.OutcomeFailed, 1)
 		}
 	}
 	return gaveUp, nil

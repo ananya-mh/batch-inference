@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -54,10 +55,11 @@ type Outcome struct {
 // CreateForBatch creates one request row per line of the batch's input file,
 // all with the given status: pending for a normal fan-out, or cancelled when
 // a batch is cancelled before it was fanned out (so its lines still appear in
-// the errors file). One statement for the whole batch; ORDER BY makes seq
+// the errors file). It returns how many it created. One statement for the
+// whole batch; ORDER BY makes seq
 // follow line order, so a batch's requests run in file order.
-func CreateForBatch(ctx context.Context, tx pgx.Tx, batchID string, status Status) error {
-	_, err := tx.Exec(ctx, `
+func CreateForBatch(ctx context.Context, tx pgx.Tx, batchID string, status Status) (int, error) {
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO requests (batch_id, custom_id, tenant_id, line_number, status, finished_at)
 		SELECT b.id, l.custom_id, b.tenant_id, l.line_number, $2::text,
 		       CASE WHEN $2::text = $3::text THEN NULL ELSE clock_timestamp() END
@@ -68,17 +70,32 @@ func CreateForBatch(ctx context.Context, tx pgx.Tx, batchID string, status Statu
 		batchID, status, StatusPending,
 	)
 	if err != nil {
-		return fmt.Errorf("create requests for %s: %w", batchID, err)
+		return 0, fmt.Errorf("create requests for %s: %w", batchID, err)
 	}
-	return nil
+	return int(tag.RowsAffected()), nil
+}
+
+// StartResult is what the worker's start check found.
+type StartResult struct {
+	// Started is true if the request may run; it is now running.
+	Started bool
+	// Body is what to send to the model, when Started.
+	Body json.RawMessage
+	// TenantID is the batch's tenant, for metrics.
+	TenantID string
+	// Waited is the time from the batch's submission until now.
+	Waited time.Duration
+	// Cancelled is true if the check itself marked the request cancelled
+	// (its batch is cancelling).
+	Cancelled bool
 }
 
 // Start is the worker's start check, run inside tx. If the request may run,
-// it moves it to running and returns its request body with started = true.
-// It returns started = false when the request must not run: its batch is no
-// longer in progress (cancelled or expired), its deadline has passed, or it
-// has already finished.
-func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.RawMessage, started bool, err error) {
+// it moves it to running and returns its request body with Started = true.
+// Started is false when the request must not run: its batch is no longer in
+// progress (cancelled or expired), its deadline has passed, or it has
+// already finished.
+func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (StartResult, error) {
 	// FOR SHARE locks the batch row against status changes until tx ends.
 	// Cancel has to wait for start checks happening right now, and any
 	// start check after cancel commits sees the new status, so once cancel
@@ -86,27 +103,27 @@ func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.
 	//
 	// The deadline is compared with the database's clock, not this server's,
 	// so every server agrees on it.
+	var result StartResult
 	var batchStatus batches.Status
 	var overdue bool
-	err = tx.QueryRow(ctx,
-		"SELECT status, expires_at <= clock_timestamp() FROM batches WHERE id = $1 FOR SHARE", batchID,
-	).Scan(&batchStatus, &overdue)
+	err := tx.QueryRow(ctx, `
+		SELECT status, expires_at <= clock_timestamp(), tenant_id, clock_timestamp() - created_at
+		FROM batches WHERE id = $1 FOR SHARE`, batchID,
+	).Scan(&batchStatus, &overdue, &result.TenantID, &result.Waited)
 	if err != nil {
-		return nil, false, fmt.Errorf("read batch %s status: %w", batchID, err)
+		return StartResult{}, fmt.Errorf("read batch %s status: %w", batchID, err)
 	}
 	if batchStatus == batches.StatusCancelling {
 		// The batch was cancelled after this job was queued (or while it
 		// waited for a retry). Mark the request cancelled so it frees its
 		// slot and lands in the errors file, and don't run it.
-		if err := cancelRequest(ctx, tx, batchID, customID); err != nil {
-			return nil, false, err
-		}
-		return nil, false, nil
+		result.Cancelled, err = cancelRequest(ctx, tx, batchID, customID)
+		return result, err
 	}
 	// Past the deadline nothing new starts, even before the scheduler's next
 	// pass marks the batch expired; that pass will expire this request.
 	if batchStatus != batches.StatusInProgress || overdue {
-		return nil, false, nil
+		return result, nil
 	}
 
 	// running is accepted as well as queued: if an earlier attempt's worker
@@ -119,21 +136,22 @@ func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.
 		batchID, customID, StatusRunning, StatusQueued,
 	).Scan(&lineNumber)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
+		return result, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("mark request %s/%s running: %w", batchID, customID, err)
+		return StartResult{}, fmt.Errorf("mark request %s/%s running: %w", batchID, customID, err)
 	}
 
-	body, err = readRequestBody(ctx, tx, batchID, lineNumber)
+	result.Body, err = readRequestBody(ctx, tx, batchID, lineNumber)
 	if err != nil {
-		return nil, false, err
+		return StartResult{}, err
 	}
-	return body, true, nil
+	result.Started = true
+	return result, nil
 }
 
-// CancelIfBatchCancelling cancels the request if its batch is cancelling,
-// and reports whether it did. Workers call it when an attempt fails: a
+// CancelIfBatchCancelling cancels the request if its batch is cancelling and
+// the request has not finished, and reports whether it did. Workers call it when an attempt fails: a
 // request whose batch is being cancelled should not wait for a retry, since
 // that would only hold up the cancel.
 func CancelIfBatchCancelling(ctx context.Context, tx pgx.Tx, batchID, customID string) (bool, error) {
@@ -144,24 +162,21 @@ func CancelIfBatchCancelling(ctx context.Context, tx pgx.Tx, batchID, customID s
 	if batchStatus != batches.StatusCancelling {
 		return false, nil
 	}
-	if err := cancelRequest(ctx, tx, batchID, customID); err != nil {
-		return false, err
-	}
-	return true, nil
+	return cancelRequest(ctx, tx, batchID, customID)
 }
 
-// cancelRequest marks a request cancelled if it has not finished yet. A
-// request that already finished keeps its result.
-func cancelRequest(ctx context.Context, tx pgx.Tx, batchID, customID string) error {
-	_, err := tx.Exec(ctx, `
+// cancelRequest marks a request cancelled if it has not finished yet, and
+// reports whether it did. A request that already finished keeps its result.
+func cancelRequest(ctx context.Context, tx pgx.Tx, batchID, customID string) (bool, error) {
+	tag, err := tx.Exec(ctx, `
 		UPDATE requests SET status = $3, finished_at = clock_timestamp()
 		WHERE batch_id = $1 AND custom_id = $2 AND status IN ($4, $5, $6)`,
 		batchID, customID, StatusCancelled, StatusPending, StatusQueued, StatusRunning,
 	)
 	if err != nil {
-		return fmt.Errorf("cancel request %s/%s: %w", batchID, customID, err)
+		return false, fmt.Errorf("cancel request %s/%s: %w", batchID, customID, err)
 	}
-	return nil
+	return tag.RowsAffected() == 1, nil
 }
 
 // readRequestBody returns the "body" part of a batch's input line, which is

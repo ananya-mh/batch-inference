@@ -20,12 +20,14 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/riverqueue/river"
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/cancel"
 	"github.com/ananya-mh/batch-inference/internal/fakemodel"
 	"github.com/ananya-mh/batch-inference/internal/files"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/model"
 	"github.com/ananya-mh/batch-inference/internal/requests"
 	"github.com/ananya-mh/batch-inference/internal/scheduler"
@@ -50,6 +52,7 @@ type system struct {
 	pool      *pgxpool.Pool
 	river     *river.Client[pgx.Tx]
 	scheduler *scheduler.Scheduler
+	metrics   *metrics.Metrics
 }
 
 // newSystem builds a fair scheduler and River client against the model at
@@ -66,12 +69,13 @@ func newSystemWithFairness(t *testing.T, pool *pgxpool.Pool, modelURL string, co
 	// Registered before start's cleanup, so it runs after the workers have
 	// stopped: whatever the test did, the invariants must hold at the end.
 	t.Cleanup(func() { testfixtures.CheckIntegrity(t, pool) })
-	riverClient, err := worker.NewRiverClient(pool, model.NewClient(modelURL, ""), config, func() { sys.scheduler.Nudge() })
+	sys.metrics = metrics.New(pool)
+	riverClient, err := worker.NewRiverClient(pool, model.NewClient(modelURL, ""), config, sys.metrics, func() { sys.scheduler.Nudge() })
 	if err != nil {
 		t.Fatalf("NewRiverClient: %v", err)
 	}
 	sys.river = riverClient
-	sys.scheduler = scheduler.New(pool, riverClient, scheduler.Config{Window: 8, PassInterval: 20 * time.Millisecond, FairScheduling: fair})
+	sys.scheduler = scheduler.New(pool, riverClient, scheduler.Config{Window: 8, PassInterval: 20 * time.Millisecond, FairScheduling: fair}, sys.metrics)
 	return sys
 }
 
@@ -591,7 +595,7 @@ func TestCancelMidBatch(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, err := cancel.Batch(ctx, pool, sys.river, "tenant_a", batch.ID); err != nil {
+	if _, err := cancel.Batch(ctx, pool, sys.river, sys.metrics, "tenant_a", batch.ID); err != nil {
 		t.Fatalf("cancel.Batch: %v", err)
 	}
 	waitForStatus(t, pool, batch.ID, batches.StatusCancelled, 30*time.Second)
@@ -632,6 +636,9 @@ func TestCancelMidBatch(t *testing.T) {
 			t.Errorf("%s appears %d times across both files, want exactly once", customID, seen[customID])
 		}
 	}
+	if counted := int(promtestutil.ToFloat64(sys.metrics.RequestOutcomes.WithLabelValues("tenant_a", metrics.OutcomeCancelled))); counted != cancelled {
+		t.Errorf("metrics counted %d cancelled, database says %d", counted, cancelled)
+	}
 	t.Logf("%d finished before or during the cancel, %d cancelled", succeeded, cancelled)
 }
 
@@ -658,7 +665,7 @@ func TestCancelDoesNotWaitForRetries(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	start := time.Now()
-	if _, err := cancel.Batch(ctx, pool, sys.river, "tenant_a", batch.ID); err != nil {
+	if _, err := cancel.Batch(ctx, pool, sys.river, sys.metrics, "tenant_a", batch.ID); err != nil {
 		t.Fatalf("cancel.Batch: %v", err)
 	}
 	waitForStatus(t, pool, batch.ID, batches.StatusCancelled, 30*time.Second)
@@ -682,7 +689,8 @@ func TestExpiryMidBatch(t *testing.T) {
 	pool := testdb.New(t)
 	modelURL := startFakeModel(t, fakemodel.Config{MinDelay: 200 * time.Millisecond, MaxDelay: 400 * time.Millisecond, OutputWords: 3})
 	batch := testfixtures.CreateBatchWithWindow(t, pool, "tenant_a", "a", 200, 2*time.Second)
-	newSystem(t, pool, modelURL, testWorkerConfig()).start(t)
+	sys := newSystem(t, pool, modelURL, testWorkerConfig())
+	sys.start(t)
 
 	waitForStatus(t, pool, batch.ID, batches.StatusExpired, 30*time.Second)
 
@@ -724,6 +732,9 @@ func TestExpiryMidBatch(t *testing.T) {
 		if customID := fmt.Sprintf("a-%d", i); seen[customID] != 1 {
 			t.Errorf("%s appears %d times across both files, want exactly once", customID, seen[customID])
 		}
+	}
+	if counted := int(promtestutil.ToFloat64(sys.metrics.RequestOutcomes.WithLabelValues("tenant_a", metrics.OutcomeExpired))); counted != expired {
+		t.Errorf("metrics counted %d expired, database says %d", counted, expired)
 	}
 	t.Logf("%d finished before the deadline, %d expired; expired %s after the deadline", succeeded, expired, expiredAfter)
 }
@@ -844,4 +855,70 @@ func describeResults(results []result) string {
 		parts[i] = fmt.Sprintf("%s succeeded=%v error=%s", r.CustomID, r.Succeeded, describeError(r))
 	}
 	return strings.Join(parts, "; ")
+}
+
+// TestMetricsMatchWhatHappened runs a batch against a flaky model and checks
+// the metrics agree with the database: completed, failed and retried counts,
+// one wait observation per request, every worker idle again at the end, and
+// only tenant/outcome labels.
+func TestMetricsMatchWhatHappened(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	ctx := context.Background()
+	modelURL := startFakeModel(t, fakemodel.Config{MaxDelay: 20 * time.Millisecond, OutputWords: 3, ErrorRate: 0.3, Seed: 7})
+	config := testWorkerConfig()
+	config.MaxAttempts = 2
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 40)
+	sys := newSystem(t, pool, modelURL, config)
+	sys.start(t)
+	waitForStatus(t, pool, batch.ID, batches.StatusCompleted, 30*time.Second)
+
+	var succeeded, failed, retriedJobs int
+	err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE status = 'succeeded'), count(*) FILTER (WHERE status = 'failed'),
+		       (SELECT count(*) FROM river_job WHERE args->>'batch_id' = $1 AND attempt > 1)
+		FROM requests WHERE batch_id = $1`, batch.ID).Scan(&succeeded, &failed, &retriedJobs)
+	if err != nil {
+		t.Fatalf("read requests: %v", err)
+	}
+	counter := func(outcome string) int {
+		return int(promtestutil.ToFloat64(sys.metrics.RequestOutcomes.WithLabelValues("tenant_a", outcome)))
+	}
+	if counter(metrics.OutcomeCompleted) != succeeded || counter(metrics.OutcomeFailed) != failed {
+		t.Errorf("metrics say %d completed, %d failed; database says %d, %d",
+			counter(metrics.OutcomeCompleted), counter(metrics.OutcomeFailed), succeeded, failed)
+	}
+	if counter(metrics.OutcomeRetried) != retriedJobs || retriedJobs == 0 {
+		t.Errorf("metrics say %d retried; %d jobs were retried (want some)", counter(metrics.OutcomeRetried), retriedJobs)
+	}
+	if waits := histogramCount(t, sys.metrics, "batch_request_wait_seconds"); waits != 40 {
+		t.Errorf("%d wait observations, want 40 (one per request)", waits)
+	}
+	if calls := histogramCount(t, sys.metrics, "batch_model_call_seconds"); calls != 40+retriedJobs {
+		t.Errorf("%d model calls observed, want %d", calls, 40+retriedJobs)
+	}
+	if busy := promtestutil.ToFloat64(sys.metrics.WorkersBusy); busy != 0 {
+		t.Errorf("%v workers busy after the batch finished, want 0", busy)
+	}
+	t.Logf("%d completed, %d failed, %d retried", succeeded, failed, retriedJobs)
+}
+
+// histogramCount returns the total number of observations in the named
+// histogram, across all its label values.
+func histogramCount(t *testing.T, m *metrics.Metrics, name string) int {
+	t.Helper()
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	total := 0
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			total += int(metric.GetHistogram().GetSampleCount())
+		}
+	}
+	return total
 }

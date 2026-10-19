@@ -18,6 +18,7 @@ import (
 	"github.com/riverqueue/river"
 
 	"github.com/ananya-mh/batch-inference/internal/database"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 )
 
 // schedulerLockID is the advisory lock key that lets only one scheduler, in
@@ -42,9 +43,10 @@ type Config struct {
 
 // Scheduler runs scheduling passes.
 type Scheduler struct {
-	pool   *pgxpool.Pool
-	river  *river.Client[pgx.Tx]
-	config Config
+	pool    *pgxpool.Pool
+	river   *river.Client[pgx.Tx]
+	config  Config
+	metrics *metrics.Metrics
 
 	// nudges holds at most one pending "run a pass soon" signal. Many
 	// nudges while a pass is running collapse into one extra pass.
@@ -52,9 +54,9 @@ type Scheduler struct {
 }
 
 // New returns a scheduler that admits requests by inserting jobs with
-// riverClient.
-func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *Scheduler {
-	return &Scheduler{pool: pool, river: riverClient, config: config, nudges: make(chan struct{}, 1)}
+// riverClient, and reports to m.
+func New(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config, m *metrics.Metrics) *Scheduler {
+	return &Scheduler{pool: pool, river: riverClient, config: config, metrics: m, nudges: make(chan struct{}, 1)}
 }
 
 // Run runs passes until ctx is cancelled: every PassInterval, and straight
@@ -112,6 +114,15 @@ func (s *Scheduler) RunPass(ctx context.Context) (PassResult, error) {
 	var result PassResult
 	var err error
 
+	passStart := time.Now()
+	defer func() {
+		outcome := "ran"
+		if result.Skipped {
+			outcome = "skipped"
+		}
+		s.metrics.SchedulerPassSeconds.WithLabelValues(outcome).Observe(time.Since(passStart).Seconds())
+	}()
+
 	if result.Completed, err = completeEndingBatches(ctx, s.pool); err != nil {
 		return result, err
 	}
@@ -144,14 +155,17 @@ func (s *Scheduler) runLockedPass(ctx context.Context, result *PassResult) error
 
 	// Expire first: an overdue batch must not be fanned out, have its
 	// requests given up as failed, or get new requests admitted.
-	if result.Expired, err = s.expireOverdueBatches(ctx, tx); err != nil {
+	// Outcomes are added up during the pass and recorded only after it
+	// commits, so a rolled-back pass never counts anything.
+	tally := metrics.Tally{}
+	if result.Expired, err = s.expireOverdueBatches(ctx, tx, tally); err != nil {
 		return err
 	}
 	if result.FannedOut, err = fanOut(ctx, tx); err != nil {
 		return err
 	}
 	// Giving up on dead jobs before admitting frees their slots for this pass.
-	if result.GaveUp, err = giveUpOnAbandonedRequests(ctx, tx); err != nil {
+	if result.GaveUp, err = giveUpOnAbandonedRequests(ctx, tx, tally); err != nil {
 		return err
 	}
 	if result.Admitted, err = s.admit(ctx, tx); err != nil {
@@ -165,5 +179,6 @@ func (s *Scheduler) runLockedPass(ctx context.Context, result *PassResult) error
 		*result = PassResult{Completed: result.Completed}
 		return fmt.Errorf("commit scheduler pass: %w", err)
 	}
+	s.metrics.Record(tally)
 	return nil
 }

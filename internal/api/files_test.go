@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/tenants"
 	"github.com/ananya-mh/batch-inference/internal/testdb"
 )
@@ -51,7 +52,7 @@ func newTestAPIWithPool(t *testing.T, maxUploadBytes int64) (http.Handler, *pgxp
 	}
 	config := testConfig()
 	config.MaxUploadBytes = maxUploadBytes
-	return NewServer(pool, newRiverClient(t, pool), config).Handler(), pool
+	return NewServer(pool, newRiverClient(t, pool), metrics.New(pool), config).Handler(), pool
 }
 
 // formField is one field of a multipart upload, in the order it is sent.

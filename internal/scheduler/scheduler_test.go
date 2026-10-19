@@ -16,6 +16,7 @@ import (
 	"github.com/riverqueue/river"
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/model"
 	"github.com/ananya-mh/batch-inference/internal/results"
 	"github.com/ananya-mh/batch-inference/internal/scheduler"
@@ -34,7 +35,7 @@ func newRiverClient(t *testing.T, pool *pgxpool.Pool) *river.Client[pgx.Tx] {
 		JobTimeout:           time.Second,
 		RescueStuckJobsAfter: 2 * time.Second,
 		RetryBaseDelay:       time.Millisecond,
-	}, func() {})
+	}, metrics.New(nil), func() {})
 	if err != nil {
 		t.Fatalf("NewRiverClient: %v", err)
 	}
@@ -45,13 +46,13 @@ func newRiverClient(t *testing.T, pool *pgxpool.Pool) *river.Client[pgx.Tx] {
 // window.
 func newScheduler(t *testing.T, pool *pgxpool.Pool, window int) *scheduler.Scheduler {
 	t.Helper()
-	return scheduler.New(pool, newRiverClient(t, pool), scheduler.Config{Window: window, PassInterval: time.Hour})
+	return scheduler.New(pool, newRiverClient(t, pool), scheduler.Config{Window: window, PassInterval: time.Hour}, metrics.New(nil))
 }
 
 // newFairScheduler returns a fair scheduler with the given window.
 func newFairScheduler(t *testing.T, pool *pgxpool.Pool, window int) *scheduler.Scheduler {
 	t.Helper()
-	return scheduler.New(pool, newRiverClient(t, pool), scheduler.Config{Window: window, PassInterval: time.Hour, FairScheduling: true})
+	return scheduler.New(pool, newRiverClient(t, pool), scheduler.Config{Window: window, PassInterval: time.Hour, FairScheduling: true}, metrics.New(nil))
 }
 
 // runPass runs one pass and fails the test on error.

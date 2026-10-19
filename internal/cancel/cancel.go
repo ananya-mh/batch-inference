@@ -12,6 +12,7 @@ import (
 
 	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/database"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/requests"
 )
 
@@ -42,8 +43,8 @@ func (e *NotCancellableError) Error() string {
 //   - anything else: returns *NotCancellableError.
 //
 // It returns batches.ErrNotFound for a batch that doesn't exist or belongs
-// to another tenant.
-func Batch(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], tenantID, batchID string) (batches.Batch, error) {
+// to another tenant. Cancelled requests are counted in m.
+func Batch(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], m *metrics.Metrics, tenantID, batchID string) (batches.Batch, error) {
 	for range maxTries {
 		batch, err := batches.Get(ctx, pool, tenantID, batchID)
 		if err != nil {
@@ -54,7 +55,7 @@ func Batch(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Client[pg
 		case batches.StatusCancelling, batches.StatusCancelled:
 			return batch, nil
 		case batches.StatusValidating, batches.StatusInProgress:
-			err := cancelInTx(ctx, pool, riverClient, batchID, batch.Status)
+			cancelled, err := cancelInTx(ctx, pool, riverClient, batchID, batch.Status)
 			if errors.Is(err, batches.ErrStatusChanged) {
 				// Something changed the status since we read it. Look
 				// again and act on the new status.
@@ -63,6 +64,8 @@ func Batch(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Client[pg
 			if err != nil {
 				return batches.Batch{}, err
 			}
+			// Counted after the commit, so a failed cancel counts nothing.
+			m.RequestOutcomes.WithLabelValues(tenantID, metrics.OutcomeCancelled).Add(float64(cancelled))
 			return batches.Get(ctx, pool, tenantID, batchID)
 		default:
 			return batch, &NotCancellableError{Status: batch.Status}
@@ -72,11 +75,12 @@ func Batch(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Client[pg
 }
 
 // cancelInTx does the cancel in one transaction: the status change and the
-// cancelling of every request that has not started.
-func cancelInTx(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], batchID string, from batches.Status) error {
+// cancelling of every request that has not started. It returns how many
+// requests it cancelled.
+func cancelInTx(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], batchID string, from batches.Status) (int, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin cancel: %w", err)
+		return 0, fmt.Errorf("begin cancel: %w", err)
 	}
 	defer database.RollbackUnlessCommitted(ctx, tx)
 
@@ -85,39 +89,42 @@ func cancelInTx(ctx context.Context, pool *pgxpool.Pool, riverClient *river.Clie
 	// it with FOR SHARE); every start check after the commit sees
 	// cancelling and does not start (guarantee 3).
 	if err := batches.Transition(ctx, tx, batchID, from, batches.StatusCancelling); err != nil {
-		return err
+		return 0, err
 	}
 
+	var cancelled int
 	if from == batches.StatusValidating {
 		// Not fanned out yet: create its requests already cancelled, so
 		// every line still shows up in the errors file.
-		if err := requests.CreateForBatch(ctx, tx, batchID, requests.StatusCancelled); err != nil {
-			return err
-		}
-	} else if err := cancelUnstartedRequests(ctx, tx, riverClient, batchID); err != nil {
-		return err
+		cancelled, err = requests.CreateForBatch(ctx, tx, batchID, requests.StatusCancelled)
+	} else {
+		cancelled, err = cancelUnstartedRequests(ctx, tx, riverClient, batchID)
+	}
+	if err != nil {
+		return 0, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit cancel: %w", err)
+		return 0, fmt.Errorf("commit cancel: %w", err)
 	}
-	return nil
+	return cancelled, nil
 }
 
 // cancelUnstartedRequests cancels every request of the batch that is not
 // running right now: waiting ones (no River job yet), queued ones, and ones
 // waiting for a retry. Queued and retrying ones also get their River job
 // cancelled, so it never runs again. Only requests whose job is running at
-// this moment are left to finish.
-func cancelUnstartedRequests(ctx context.Context, tx pgx.Tx, riverClient *river.Client[pgx.Tx], batchID string) error {
-	_, err := tx.Exec(ctx, `
+// this moment are left to finish. It returns how many requests it cancelled.
+func cancelUnstartedRequests(ctx context.Context, tx pgx.Tx, riverClient *river.Client[pgx.Tx], batchID string) (int, error) {
+	waiting, err := tx.Exec(ctx, `
 		UPDATE requests SET status = $2, finished_at = clock_timestamp()
 		WHERE batch_id = $1 AND status = $3`,
 		batchID, requests.StatusCancelled, requests.StatusPending,
 	)
 	if err != nil {
-		return fmt.Errorf("cancel waiting requests: %w", err)
+		return 0, fmt.Errorf("cancel waiting requests: %w", err)
 	}
+	cancelled := int(waiting.RowsAffected())
 
 	// A request waiting for a retry is still "running" in our table, but its
 	// River job is retryable, not running, so it is cancelled here too.
@@ -131,7 +138,7 @@ func cancelUnstartedRequests(ctx context.Context, tx pgx.Tx, riverClient *river.
 		batchID, requests.StatusQueued, requests.StatusRunning,
 	)
 	if err != nil {
-		return fmt.Errorf("find unstarted requests: %w", err)
+		return 0, fmt.Errorf("find unstarted requests: %w", err)
 	}
 	type unstarted struct {
 		CustomID string
@@ -139,26 +146,27 @@ func cancelUnstartedRequests(ctx context.Context, tx pgx.Tx, riverClient *river.
 	}
 	found, err := pgx.CollectRows(rows, pgx.RowToStructByPos[unstarted])
 	if err != nil {
-		return fmt.Errorf("read unstarted requests: %w", err)
+		return 0, fmt.Errorf("read unstarted requests: %w", err)
 	}
 
 	for _, request := range found {
 		// The request first, then its job: the same order workers lock
 		// them in when saving a result, so the two can never deadlock.
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE requests SET status = $3, finished_at = clock_timestamp()
 			WHERE batch_id = $1 AND custom_id = $2 AND status IN ($4, $5)`,
 			batchID, request.CustomID, requests.StatusCancelled, requests.StatusQueued, requests.StatusRunning,
 		)
 		if err != nil {
-			return fmt.Errorf("cancel request %s: %w", request.CustomID, err)
+			return 0, fmt.Errorf("cancel request %s: %w", request.CustomID, err)
 		}
+		cancelled += int(tag.RowsAffected())
 		// If River fetched the job a moment ago, this only signals the
 		// worker; its start check then waits for this transaction and sees
 		// the batch is cancelling, so the model is still never called.
 		if _, err := riverClient.JobCancelTx(ctx, tx, request.JobID); err != nil {
-			return fmt.Errorf("cancel job of %s: %w", request.CustomID, err)
+			return 0, fmt.Errorf("cancel job of %s: %w", request.CustomID, err)
 		}
 	}
-	return nil
+	return cancelled, nil
 }

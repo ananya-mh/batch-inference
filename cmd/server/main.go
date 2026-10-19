@@ -16,6 +16,7 @@ import (
 
 	"github.com/ananya-mh/batch-inference/internal/api"
 	"github.com/ananya-mh/batch-inference/internal/database"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/model"
 	"github.com/ananya-mh/batch-inference/internal/scheduler"
 	"github.com/ananya-mh/batch-inference/internal/tenants"
@@ -62,12 +63,13 @@ func run() error {
 	// scheduler inserts jobs through the River client, so each needs the
 	// other. The nudge function is only called once workers are running,
 	// by which time sched is set.
+	serviceMetrics := metrics.New(pool)
 	var sched *scheduler.Scheduler
-	riverClient, err := worker.NewRiverClient(pool, model.NewClient(cfg.modelBaseURL, cfg.modelAPIKey), cfg.worker, func() { sched.Nudge() })
+	riverClient, err := worker.NewRiverClient(pool, model.NewClient(cfg.modelBaseURL, cfg.modelAPIKey), cfg.worker, serviceMetrics, func() { sched.Nudge() })
 	if err != nil {
 		return err
 	}
-	sched = scheduler.New(pool, riverClient, cfg.scheduler)
+	sched = scheduler.New(pool, riverClient, cfg.scheduler, serviceMetrics)
 
 	// River gets a context that is never cancelled: cancelling it would stop
 	// workers abruptly. It is stopped gracefully with Stop below instead.
@@ -86,7 +88,7 @@ func run() error {
 
 	httpServer := &http.Server{
 		Addr:    cfg.httpAddr,
-		Handler: api.NewServer(pool, riverClient, cfg.api).Handler(),
+		Handler: api.NewServer(pool, riverClient, serviceMetrics, cfg.api).Handler(),
 		// Without timeouts, slow or stuck clients could hold connections
 		// open forever.
 		ReadHeaderTimeout: 10 * time.Second,

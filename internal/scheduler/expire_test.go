@@ -20,6 +20,7 @@ import (
 	"github.com/ananya-mh/batch-inference/internal/cancel"
 	"github.com/ananya-mh/batch-inference/internal/database"
 	"github.com/ananya-mh/batch-inference/internal/files"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/requests"
 	"github.com/ananya-mh/batch-inference/internal/testdb"
 	"github.com/ananya-mh/batch-inference/internal/testfixtures"
@@ -218,7 +219,7 @@ func TestExpiryAndCancelRace(t *testing.T) {
 		go func() {
 			defer done.Done()
 			start.Wait()
-			_, cancelErr = cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+			_, cancelErr = cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 		}()
 		go func() {
 			defer done.Done()

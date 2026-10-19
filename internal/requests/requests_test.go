@@ -86,12 +86,15 @@ func TestStartMarksRunningAndReturnsBody(t *testing.T) {
 	pool, batchID := setupQueuedRequest(t)
 
 	inTx(t, pool, func(tx pgx.Tx) {
-		body, started, err := requests.Start(context.Background(), tx, batchID, "r-0")
-		if err != nil || !started {
-			t.Fatalf("Start = started %v, err %v; want started", started, err)
+		result, err := requests.Start(context.Background(), tx, batchID, "r-0")
+		if err != nil || !result.Started {
+			t.Fatalf("Start = started %v, err %v; want started", result.Started, err)
 		}
-		if !strings.Contains(string(body), "classify ticket r-0") {
-			t.Errorf("body = %s, want the line's request body", body)
+		if !strings.Contains(string(result.Body), "classify ticket r-0") {
+			t.Errorf("body = %s, want the line's request body", result.Body)
+		}
+		if result.TenantID != "tenant_a" || result.Waited <= 0 {
+			t.Errorf("tenant %q, waited %s; want tenant_a and a positive wait", result.TenantID, result.Waited)
 		}
 	})
 	if status := requestStatus(t, pool, batchID); status != requests.StatusRunning {
@@ -110,8 +113,8 @@ func TestStartCancelsRequestOfCancellingBatch(t *testing.T) {
 	}
 
 	inTx(t, pool, func(tx pgx.Tx) {
-		if _, started, err := requests.Start(context.Background(), tx, batchID, "r-0"); err != nil || started {
-			t.Errorf("Start = started %v, err %v; want not started", started, err)
+		if result, err := requests.Start(context.Background(), tx, batchID, "r-0"); err != nil || result.Started {
+			t.Errorf("Start = started %v, err %v; want not started", result.Started, err)
 		}
 	})
 	if status := requestStatus(t, pool, batchID); status != requests.StatusCancelled {
@@ -127,8 +130,8 @@ func TestStartAcceptsRequestLeftRunningByCrashedAttempt(t *testing.T) {
 
 	for attempt := 1; attempt <= 2; attempt++ {
 		inTx(t, pool, func(tx pgx.Tx) {
-			if _, started, err := requests.Start(context.Background(), tx, batchID, "r-0"); err != nil || !started {
-				t.Errorf("attempt %d: Start = started %v, err %v; want started", attempt, started, err)
+			if result, err := requests.Start(context.Background(), tx, batchID, "r-0"); err != nil || !result.Started {
+				t.Errorf("attempt %d: Start = started %v, err %v; want started", attempt, result.Started, err)
 			}
 		})
 	}
@@ -141,7 +144,7 @@ func TestFinishSavesOnlyOnce(t *testing.T) {
 	pool, batchID := setupQueuedRequest(t)
 	ctx := context.Background()
 	inTx(t, pool, func(tx pgx.Tx) {
-		if _, _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
+		if _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
 	})
@@ -169,7 +172,7 @@ func TestConcurrentFinishSavesOnlyOnce(t *testing.T) {
 	pool, batchID := setupQueuedRequest(t)
 	ctx := context.Background()
 	inTx(t, pool, func(tx pgx.Tx) {
-		if _, _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
+		if _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
 	})
@@ -227,7 +230,7 @@ func TestFinishAfterExpirySavesNothing(t *testing.T) {
 	pool, batchID := setupQueuedRequest(t)
 	ctx := context.Background()
 	inTx(t, pool, func(tx pgx.Tx) {
-		if _, _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
+		if _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
 	})
@@ -284,8 +287,8 @@ func TestStartRefusesAfterDeadline(t *testing.T) {
 	passDeadline(t, pool, batchID)
 
 	inTx(t, pool, func(tx pgx.Tx) {
-		if _, started, err := requests.Start(context.Background(), tx, batchID, "r-0"); err != nil || started {
-			t.Errorf("Start = started %v, err %v; want not started", started, err)
+		if result, err := requests.Start(context.Background(), tx, batchID, "r-0"); err != nil || result.Started {
+			t.Errorf("Start = started %v, err %v; want not started", result.Started, err)
 		}
 	})
 	if status := requestStatus(t, pool, batchID); status != requests.StatusQueued {
@@ -300,7 +303,7 @@ func TestFinishRefusesAfterDeadline(t *testing.T) {
 	pool, batchID := setupQueuedRequest(t)
 	ctx := context.Background()
 	inTx(t, pool, func(tx pgx.Tx) {
-		if _, _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
+		if _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
 	})

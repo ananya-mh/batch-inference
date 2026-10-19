@@ -20,6 +20,7 @@ import (
 	"github.com/ananya-mh/batch-inference/internal/batches"
 	"github.com/ananya-mh/batch-inference/internal/cancel"
 	"github.com/ananya-mh/batch-inference/internal/files"
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 	"github.com/ananya-mh/batch-inference/internal/model"
 	"github.com/ananya-mh/batch-inference/internal/scheduler"
 	"github.com/ananya-mh/batch-inference/internal/testdb"
@@ -34,11 +35,11 @@ func setup(t *testing.T, window int) (*pgxpool.Pool, *river.Client[pgx.Tx], *sch
 	pool := testdb.New(t)
 	riverClient, err := worker.NewRiverClient(pool, model.NewClient("http://unused.invalid/v1", ""), worker.Config{
 		Workers: 1, MaxAttempts: 3, JobTimeout: time.Second, RescueStuckJobsAfter: 2 * time.Second, RetryBaseDelay: time.Millisecond,
-	}, func() {})
+	}, metrics.New(nil), func() {})
 	if err != nil {
 		t.Fatalf("NewRiverClient: %v", err)
 	}
-	return pool, riverClient, scheduler.New(pool, riverClient, scheduler.Config{Window: window, PassInterval: time.Hour})
+	return pool, riverClient, scheduler.New(pool, riverClient, scheduler.Config{Window: window, PassInterval: time.Hour}, metrics.New(nil))
 }
 
 // runPass runs one scheduler pass and fails the test on error.
@@ -169,7 +170,7 @@ func TestCancelInProgressBatch(t *testing.T) {
 	exec(t, pool, "UPDATE river_job SET state = 'retryable', attempt = 1, scheduled_at = now() + interval '1 minute' WHERE args->>'custom_id' = 'a-2'")
 	// a-3 and a-4 are queued with available jobs; a-5 ... a-9 wait.
 
-	got, err := cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+	got, err := cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 	if err != nil {
 		t.Fatalf("cancel.Batch: %v", err)
 	}
@@ -228,7 +229,7 @@ func TestCancelBeforeFanOut(t *testing.T) {
 	pool, riverClient, s := setup(t, 5)
 	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 4)
 
-	if _, err := cancel.Batch(context.Background(), pool, riverClient, "tenant_a", batch.ID); err != nil {
+	if _, err := cancel.Batch(context.Background(), pool, riverClient, metrics.New(nil), "tenant_a", batch.ID); err != nil {
 		t.Fatalf("cancel.Batch: %v", err)
 	}
 	runPass(t, s)
@@ -254,18 +255,18 @@ func TestCancelTwiceReturnsCurrentState(t *testing.T) {
 	exec(t, pool, "UPDATE requests SET status = 'running' WHERE custom_id = 'a-0'")
 	exec(t, pool, "UPDATE river_job SET state = 'running', attempt = 1, attempted_at = now() WHERE args->>'custom_id' = 'a-0'")
 
-	first, err := cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+	first, err := cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 	if err != nil {
 		t.Fatalf("first cancel: %v", err)
 	}
-	second, err := cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+	second, err := cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 	if err != nil || second.Status != batches.StatusCancelling || !second.CancellingAt.Equal(*first.CancellingAt) {
 		t.Errorf("second cancel = %s at %v (err %v); want cancelling, unchanged", second.Status, second.CancellingAt, err)
 	}
 
 	succeed(t, pool, batch.ID, "a-0")
 	runPass(t, s)
-	third, err := cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+	third, err := cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 	if err != nil || third.Status != batches.StatusCancelled {
 		t.Errorf("cancel after cancelled = %s (err %v); want cancelled, no error", third.Status, err)
 	}
@@ -284,7 +285,7 @@ func TestCancelFinishedBatchIsRefused(t *testing.T) {
 
 	for _, wantStatus := range []batches.Status{batches.StatusFinalizing, batches.StatusCompleted} {
 		runPass(t, s)
-		got, err := cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+		got, err := cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 		var notCancellable *cancel.NotCancellableError
 		if !errors.As(err, &notCancellable) || notCancellable.Status != wantStatus {
 			t.Fatalf("cancel of %s batch: error = %v, want NotCancellableError", wantStatus, err)
@@ -305,7 +306,7 @@ func TestCancelOtherTenantsBatch(t *testing.T) {
 	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 1)
 	testfixtures.CreateTenant(t, pool, "tenant_b")
 
-	if _, err := cancel.Batch(context.Background(), pool, riverClient, "tenant_b", batch.ID); !errors.Is(err, batches.ErrNotFound) {
+	if _, err := cancel.Batch(context.Background(), pool, riverClient, metrics.New(nil), "tenant_b", batch.ID); !errors.Is(err, batches.ErrNotFound) {
 		t.Errorf("error = %v, want ErrNotFound", err)
 	}
 	if status := testfixtures.BatchStatus(t, pool, batch.ID); status != batches.StatusValidating {
@@ -336,7 +337,7 @@ func TestCancelAndFinalizeRace(t *testing.T) {
 		go func() {
 			defer done.Done()
 			start.Wait()
-			_, cancelErr = cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+			_, cancelErr = cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 		}()
 		go func() {
 			defer done.Done()
@@ -395,7 +396,7 @@ func TestCancelAndFanOutRace(t *testing.T) {
 		go func() {
 			defer done.Done()
 			start.Wait()
-			_, cancelErr = cancel.Batch(ctx, pool, riverClient, "tenant_a", batch.ID)
+			_, cancelErr = cancel.Batch(ctx, pool, riverClient, metrics.New(nil), "tenant_a", batch.ID)
 		}()
 		go func() {
 			defer done.Done()

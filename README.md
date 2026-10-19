@@ -200,6 +200,34 @@ which gave 5 attempts in all 10 runs, done 0.1–0.2 s before the end in the fai
 
 So the gap is a tail effect of one unlucky request's retry chain, not a slowdown while the batch is running: on average over the run, 13.1 against 13.5 workers are busy, and most of that difference is the tail. It would shrink as the big batch grows.
 
+## Metrics
+
+The server serves Prometheus metrics at `http://localhost:8080/metrics`, and `docker compose up` starts a Prometheus at `http://localhost:9090` that scrapes it every second. Labels are only ever `tenant` and `outcome`, never a batch or request ID (a test checks this), so the number of time series stays small however many batches run.
+
+| Metric | Type | Labels | What it measures |
+|--------|------|--------|------------------|
+| `batch_workers_busy` | gauge | | Workers on this server running a request right now |
+| `batch_workers_total` | gauge | | Workers on this server |
+| `batch_requests_in_flight` | gauge | `tenant` | Requests holding a slot in the window (in River or running, including waiting for a retry) |
+| `batch_requests_waiting_for_retry` | gauge | `tenant` | In-flight requests waiting out a retry delay |
+| `batch_queue_depth` | gauge | `tenant` | Requests waiting in the scheduler's table for a slot |
+| `batch_request_wait_seconds` | histogram | `tenant` | From a batch's submission until a request's model call first started |
+| `batch_request_outcomes_total` | counter | `tenant`, `outcome` | Requests by outcome: `completed`, `failed`, `retried` (one per retried attempt), `expired`, `cancelled` |
+| `batch_model_call_seconds` | histogram | `outcome` | Model call duration, `success` or `error` |
+| `batch_scheduler_pass_seconds` | histogram | `outcome` | Scheduler pass duration, `ran` or `skipped` (another server held the lock) |
+
+The three per-tenant gauges are read from Postgres at each scrape and describe the whole service, so with several servers take `max()` of them across servers, not `sum()`. Outcomes are counted only after the database change that caused them commits, so rolled-back work is never counted.
+
+**Repeating the throughput investigation with metrics** (instead of the experiment script's own sampler), in Prometheus at `http://localhost:9090`:
+
+```promql
+sum(batch_workers_busy)                                     # busy workers over time: look for an idle tail
+sum by (tenant) (batch_requests_waiting_for_retry)          # who holds slots while waiting for a retry
+sum by (tenant) (batch_requests_in_flight)                  # each tenant's share of the window
+histogram_quantile(0.99, sum by (tenant, le) (rate(batch_request_wait_seconds_bucket[1m])))  # p99 wait per tenant
+sum by (outcome) (rate(batch_request_outcomes_total[1m]))   # completed, retried, failed per second
+```
+
 ## Settings
 
 | Variable | Default | Meaning |

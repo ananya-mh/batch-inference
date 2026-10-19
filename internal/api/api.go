@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
+
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 )
 
 // DefaultMaxUploadBytes is the default upload size limit: 100 MB.
@@ -26,15 +28,16 @@ type Config struct {
 
 // Server holds what the HTTP handlers need to do their work.
 type Server struct {
-	pool   *pgxpool.Pool
-	river  *river.Client[pgx.Tx]
-	config Config
+	pool    *pgxpool.Pool
+	river   *river.Client[pgx.Tx]
+	metrics *metrics.Metrics
+	config  Config
 }
 
-// NewServer returns a Server that uses pool for database access, and
-// riverClient to cancel the jobs of cancelled batches.
-func NewServer(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Config) *Server {
-	return &Server{pool: pool, river: riverClient, config: config}
+// NewServer returns a Server that uses pool for database access,
+// riverClient to cancel the jobs of cancelled batches, and m for metrics.
+func NewServer(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], m *metrics.Metrics, config Config) *Server {
+	return &Server{pool: pool, river: riverClient, metrics: m, config: config}
 }
 
 // Handler returns an http.Handler with every route registered. Every /v1
@@ -42,6 +45,9 @@ func NewServer(pool *pgxpool.Pool, riverClient *river.Client[pgx.Tx], config Con
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	// For Prometheus. No API key: like /healthz, it is meant for the
+	// operator's network, and it never shows batch or request IDs.
+	mux.Handle("GET /metrics", s.metrics.Handler())
 
 	mux.HandleFunc("POST /v1/files", s.requireTenant(s.handleUploadFile))
 	mux.HandleFunc("GET /v1/files/{id}", s.requireTenant(s.handleGetFile))
