@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/ananya-mh/batch-inference/internal/metrics"
 )
 
 // postBatch sends body to POST /v1/batches as the tenant with apiKey.
@@ -295,5 +297,41 @@ func TestCancelCompletedBatchIsConflict(t *testing.T) {
 	}
 	if message := errorMessage(t, response); message != "Cannot cancel a batch with status 'completed'." {
 		t.Errorf("message = %q", message)
+	}
+}
+
+// TestBatchSizeLimit checks a file with more requests than MAX_BATCH_REQUESTS
+// cannot become a batch, and one at the limit can. The limit is set low here
+// to keep the test fast; the default is checked separately.
+func TestBatchSizeLimit(t *testing.T) {
+	t.Parallel()
+	handler, pool := newTestAPIWithPool(t, DefaultMaxUploadBytes)
+	// Rebuild the API with a limit of 3 requests per batch, on the same
+	// database and tenants.
+	config := testConfig()
+	config.MaxBatchRequests = 3
+	limited := NewServer(pool, newRiverClient(t, pool), metrics.New(pool), config).Handler()
+
+	atLimit := uploadBatchFile(t, handler, keyTenantA, batchLine("a")+"\n"+batchLine("b")+"\n"+batchLine("c")+"\n")
+	overLimit := uploadBatchFile(t, handler, keyTenantA, batchLine("a")+"\n"+batchLine("b")+"\n"+batchLine("c")+"\n"+batchLine("d")+"\n")
+
+	if response := postBatch(t, limited, keyTenantA, createBatchBody(atLimit, "/v1/chat/completions", "24h")); response.Code != http.StatusOK {
+		t.Errorf("3 requests: status %d, want 200; body %s", response.Code, response.Body)
+	}
+	response := postBatch(t, limited, keyTenantA, createBatchBody(overLimit, "/v1/chat/completions", "24h"))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("4 requests: status %d, want 400", response.Code)
+	}
+	if message := errorMessage(t, response); !strings.Contains(message, "has 4 requests; a batch may have at most 3") {
+		t.Errorf("message = %q", message)
+	}
+}
+
+// TestDefaultBatchSizeLimitIsOpenAIs checks the default matches OpenAI's
+// limit of 50,000 requests per batch.
+func TestDefaultBatchSizeLimitIsOpenAIs(t *testing.T) {
+	t.Parallel()
+	if DefaultMaxBatchRequests != 50_000 {
+		t.Errorf("DefaultMaxBatchRequests = %d, want 50000", DefaultMaxBatchRequests)
 	}
 }

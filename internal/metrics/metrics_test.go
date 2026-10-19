@@ -33,6 +33,7 @@ func exerciseAll(m *metrics.Metrics) {
 	m.RequestWaitSeconds.WithLabelValues("tenant_a").Observe(1.5)
 	m.ModelCallSeconds.WithLabelValues(metrics.CallSucceeded).Observe(0.2)
 	m.SchedulerPassSeconds.WithLabelValues("ran").Observe(0.004)
+	m.ResultsFilesWriteSeconds.Observe(0.5)
 }
 
 // ourFamilies gathers the metrics and returns ours (named batch_...), by name.
@@ -91,6 +92,7 @@ func TestNoMetricIsLabeledByID(t *testing.T) {
 		"batch_workers_busy", "batch_workers_total", "batch_request_outcomes_total",
 		"batch_request_wait_seconds", "batch_model_call_seconds", "batch_scheduler_pass_seconds",
 		"batch_queue_depth", "batch_requests_in_flight", "batch_requests_waiting_for_retry",
+		"batch_results_files_write_seconds",
 	}
 	for _, name := range want {
 		if families[name] == nil {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -115,7 +116,7 @@ var endStatus = map[batches.Status]batches.Status{
 // (finalizing batches, and cancelling batches whose running requests have
 // all finished) and moves each to its final status, one batch per
 // transaction. It returns how many batches it ended.
-func completeEndingBatches(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+func completeEndingBatches(ctx context.Context, pool *pgxpool.Pool, m *metrics.Metrics) (int, error) {
 	// A cancelling batch waits until its in-flight requests finish, so
 	// their results make it into the files.
 	rows, err := pool.Query(ctx, `
@@ -143,7 +144,7 @@ func completeEndingBatches(ctx context.Context, pool *pgxpool.Pool) (int, error)
 
 	completed := 0
 	for _, batch := range ready {
-		done, err := completeBatch(ctx, pool, batch.ID, batch.Status, endStatus[batch.Status])
+		done, err := completeBatch(ctx, pool, m, batch.ID, batch.Status, endStatus[batch.Status])
 		if err != nil {
 			return completed, err
 		}
@@ -161,7 +162,7 @@ func completeEndingBatches(ctx context.Context, pool *pgxpool.Pool) (int, error)
 // and the batch unchanged, so the next pass simply does it again; the files
 // can never be written twice or half-written. It returns false if another
 // server is already completing this batch.
-func completeBatch(ctx context.Context, pool *pgxpool.Pool, batchID string, from, to batches.Status) (bool, error) {
+func completeBatch(ctx context.Context, pool *pgxpool.Pool, m *metrics.Metrics, batchID string, from, to batches.Status) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin completing %s: %w", batchID, err)
@@ -182,7 +183,9 @@ func completeBatch(ctx context.Context, pool *pgxpool.Pool, batchID string, from
 		return false, fmt.Errorf("lock batch %s: %w", batchID, err)
 	}
 
+	writeStart := time.Now()
 	outputFileID, errorFileID, err := results.WriteFiles(ctx, tx, batchID)
+	m.ResultsFilesWriteSeconds.Observe(time.Since(writeStart).Seconds())
 	if err != nil {
 		return false, err
 	}

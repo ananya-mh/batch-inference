@@ -48,6 +48,17 @@ type Config struct {
 	// RetryBaseDelay is the wait after the first failed attempt; each later
 	// wait doubles, up to 8 seconds. Tests use a few milliseconds.
 	RetryBaseDelay time.Duration
+
+	// FetchCooldown is the shortest time between two fetches of new jobs by
+	// River. Each fetch takes at most as many jobs as there are free
+	// workers, so this caps throughput at about Workers / FetchCooldown.
+	// Zero means River's default (100 ms).
+	FetchCooldown time.Duration
+
+	// FetchPollInterval is how often River looks for jobs when it hears of
+	// none (new jobs normally arrive through LISTEN/NOTIFY). Zero means
+	// River's default (1 s).
+	FetchPollInterval time.Duration
 }
 
 // Worker is the River worker for requests.RunArgs jobs.
@@ -84,6 +95,8 @@ func NewRiverClient(pool *pgxpool.Pool, modelClient *model.Client, config Config
 		MaxAttempts:          config.MaxAttempts,
 		JobTimeout:           config.JobTimeout,
 		RescueStuckJobsAfter: config.RescueStuckJobsAfter,
+		FetchCooldown:        config.FetchCooldown,
+		FetchPollInterval:    config.FetchPollInterval,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create river client: %w", err)

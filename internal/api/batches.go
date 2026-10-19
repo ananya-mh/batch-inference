@@ -165,6 +165,13 @@ func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("input file %q has purpose %q, want %q", inputFile.ID, inputFile.Purpose, files.PurposeBatch))
 		return
 	}
+	// One batch has a bounded size, as with OpenAI; bigger jobs are split
+	// into several batches.
+	if inputFile.LineCount > s.config.MaxBatchRequests {
+		writeError(w, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("input file %q has %d requests; a batch may have at most %d", inputFile.ID, inputFile.LineCount, s.config.MaxBatchRequests))
+		return
+	}
 
 	batch, err := batches.Create(ctx, s.pool, batches.NewBatch{
 		TenantID:         tenantID,

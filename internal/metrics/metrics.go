@@ -54,6 +54,9 @@ type Metrics struct {
 	// SchedulerPassSeconds is how long scheduler passes took. The outcome is
 	// "ran", or "skipped" when another server held the scheduler lock.
 	SchedulerPassSeconds *prometheus.HistogramVec
+	// ResultsFilesWriteSeconds is how long writing a finished batch's
+	// results and errors files took.
+	ResultsFilesWriteSeconds prometheus.Histogram
 }
 
 // New creates the metrics. If pool is not nil, scrapes also report the
@@ -92,11 +95,16 @@ func New(pool *pgxpool.Pool) *Metrics {
 			Help:    "Duration of scheduler passes; outcome is ran, or skipped when another server held the lock.",
 			Buckets: []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
 		}, []string{"outcome"}),
+		ResultsFilesWriteSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "batch_results_files_write_seconds",
+			Help:    "Time to write a finished batch's results and errors files.",
+			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}),
 	}
 
 	m.registry.MustRegister(
 		m.WorkersBusy, m.WorkersTotal, m.RequestOutcomes, m.RequestWaitSeconds,
-		m.ModelCallSeconds, m.SchedulerPassSeconds,
+		m.ModelCallSeconds, m.SchedulerPassSeconds, m.ResultsFilesWriteSeconds,
 		// Standard Go runtime and process metrics (memory, goroutines, CPU).
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),

@@ -16,10 +16,17 @@ import (
 // DefaultMaxUploadBytes is the default upload size limit: 100 MB.
 const DefaultMaxUploadBytes = 100 << 20
 
+// DefaultMaxBatchRequests is the default limit on requests in one batch:
+// 50,000, the same as OpenAI's.
+const DefaultMaxBatchRequests = 50_000
+
 // Config holds the API's settings.
 type Config struct {
 	// MaxUploadBytes is the largest upload accepted, in bytes.
 	MaxUploadBytes int64
+
+	// MaxBatchRequests is the most requests (lines) one batch may have.
+	MaxBatchRequests int
 
 	// CompletionWindows maps each completion window clients may ask for
 	// (like "24h") to its length.

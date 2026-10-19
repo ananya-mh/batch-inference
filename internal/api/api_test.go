@@ -22,6 +22,7 @@ import (
 func testConfig() Config {
 	return Config{
 		MaxUploadBytes:    DefaultMaxUploadBytes,
+		MaxBatchRequests:  DefaultMaxBatchRequests,
 		CompletionWindows: map[string]time.Duration{"24h": 24 * time.Hour, "2s": 2 * time.Second},
 	}
 }

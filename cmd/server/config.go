@@ -43,6 +43,9 @@ func readConfig() (config, error) {
 	if cfg.api.MaxUploadBytes, err = envInt64("MAX_UPLOAD_BYTES", api.DefaultMaxUploadBytes); err != nil {
 		return config{}, err
 	}
+	if cfg.api.MaxBatchRequests, err = envInt("MAX_BATCH_REQUESTS", api.DefaultMaxBatchRequests); err != nil {
+		return config{}, err
+	}
 	if cfg.api.CompletionWindows, err = batches.ParseCompletionWindows(envString("COMPLETION_WINDOWS", batches.DefaultCompletionWindows)); err != nil {
 		return config{}, fmt.Errorf("COMPLETION_WINDOWS: %w", err)
 	}
@@ -67,6 +70,14 @@ func readConfig() (config, error) {
 		return config{}, err
 	}
 	cfg.worker.RetryBaseDelay = time.Second
+	// River's own defaults; see "Throughput" in the README for what changing
+	// them does.
+	if cfg.worker.FetchCooldown, err = envDuration("RIVER_FETCH_COOLDOWN", 100*time.Millisecond); err != nil {
+		return config{}, err
+	}
+	if cfg.worker.FetchPollInterval, err = envDuration("RIVER_FETCH_POLL_INTERVAL", time.Second); err != nil {
+		return config{}, err
+	}
 
 	// Twice the workers by default, so each worker always has its next job
 	// ready (see "Settings" in DESIGN.md).
@@ -90,6 +101,13 @@ func readConfig() (config, error) {
 func (cfg config) check() error {
 	if cfg.api.MaxUploadBytes <= 0 {
 		return errors.New("MAX_UPLOAD_BYTES must be positive")
+	}
+	if cfg.api.MaxBatchRequests < 1 {
+		return errors.New("MAX_BATCH_REQUESTS must be at least 1")
+	}
+	// River refuses values below 1 ms.
+	if cfg.worker.FetchCooldown < time.Millisecond || cfg.worker.FetchPollInterval < time.Millisecond {
+		return errors.New("RIVER_FETCH_COOLDOWN and RIVER_FETCH_POLL_INTERVAL must be at least 1ms")
 	}
 	if cfg.worker.Workers < 1 || cfg.worker.MaxAttempts < 1 || cfg.scheduler.Window < 1 {
 		return errors.New("WORKERS, MAX_ATTEMPTS, and SCHEDULER_WINDOW must each be at least 1")

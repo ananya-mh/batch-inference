@@ -123,7 +123,7 @@ func (s *Scheduler) RunPass(ctx context.Context) (PassResult, error) {
 		s.metrics.SchedulerPassSeconds.WithLabelValues(outcome).Observe(time.Since(passStart).Seconds())
 	}()
 
-	if result.Completed, err = completeEndingBatches(ctx, s.pool); err != nil {
+	if result.Completed, err = completeEndingBatches(ctx, s.pool, s.metrics); err != nil {
 		return result, err
 	}
 	if err := s.runLockedPass(ctx, &result); err != nil {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -106,7 +107,9 @@ func (s *Scheduler) expireBatch(ctx context.Context, tx pgx.Tx, batchID string, 
 		}
 	}
 
+	writeStart := time.Now()
 	outputFileID, errorFileID, err := results.WriteFiles(ctx, savepoint, batchID)
+	s.metrics.ResultsFilesWriteSeconds.Observe(time.Since(writeStart).Seconds())
 	if err != nil {
 		return 0, err
 	}
