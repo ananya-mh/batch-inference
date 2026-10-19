@@ -1,7 +1,7 @@
 // Package scheduler feeds batch requests into River a few at a time. Each pass
 // writes the files of batches that are ending (finalizing, or cancelled with
-// nothing left running) and ends them, then (under a lock) fans
-// out new batches into requests, gives up on requests whose jobs died,
+// nothing left running) and ends them, then (under a lock) expires overdue
+// batches, fans out new batches into requests, gives up on requests whose jobs died,
 // admits pending requests into free slots of the window, and marks batches
 // whose requests are all done as finalizing. See "Fan-out and fair
 // scheduling" in DESIGN.md.
@@ -86,6 +86,7 @@ func (s *Scheduler) Nudge() {
 // PassResult says what one pass did. Tests and logs use it.
 type PassResult struct {
 	Skipped    bool // another scheduler holds the lock
+	Expired    int  // batches whose deadline passed, now expired with their files
 	FannedOut  int  // batches turned into requests
 	GaveUp     int  // requests failed because their job ended without a result
 	Admitted   int  // requests given a River job
@@ -135,6 +136,11 @@ func (s *Scheduler) runLockedPass(ctx context.Context, result *PassResult) error
 		return nil
 	}
 
+	// Expire first: an overdue batch must not be fanned out, have its
+	// requests given up as failed, or get new requests admitted.
+	if result.Expired, err = s.expireOverdueBatches(ctx, tx); err != nil {
+		return err
+	}
 	if result.FannedOut, err = fanOut(ctx, tx); err != nil {
 		return err
 	}

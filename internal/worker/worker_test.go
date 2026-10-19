@@ -663,3 +663,58 @@ func TestCancelDoesNotWaitForRetries(t *testing.T) {
 		}
 	}
 }
+
+// TestExpiryMidBatch runs a batch with a 2-second window against a model too
+// slow to finish it. At the deadline the batch expires: results saved before
+// the deadline are kept, nothing is saved after it, and every custom_id is in
+// exactly one file.
+func TestExpiryMidBatch(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	modelURL := startFakeModel(t, fakemodel.Config{MinDelay: 200 * time.Millisecond, MaxDelay: 400 * time.Millisecond, OutputWords: 3})
+	batch := testfixtures.CreateBatchWithWindow(t, pool, "tenant_a", "a", 200, 2*time.Second)
+	newSystem(t, pool, modelURL, testWorkerConfig()).start(t)
+
+	waitForStatus(t, pool, batch.ID, batches.StatusExpired, 30*time.Second)
+
+	ctx := context.Background()
+	var succeeded, expired, savedLate int
+	var expiredAfter time.Duration
+	err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE r.status = 'succeeded'),
+		       count(*) FILTER (WHERE r.status = 'expired'),
+		       count(*) FILTER (WHERE r.status = 'succeeded' AND r.finished_at >= b.expires_at),
+		       max(b.expired_at - b.expires_at)
+		FROM requests r JOIN batches b ON b.id = r.batch_id WHERE b.id = $1`, batch.ID,
+	).Scan(&succeeded, &expired, &savedLate, &expiredAfter)
+	if err != nil {
+		t.Fatalf("read requests: %v", err)
+	}
+	if succeeded == 0 || expired == 0 || succeeded+expired != 200 {
+		t.Errorf("%d succeeded, %d expired; want some of each, 200 in total", succeeded, expired)
+	}
+	if savedLate != 0 {
+		t.Errorf("%d results saved after the deadline were kept", savedLate)
+	}
+
+	final, err := batches.Get(ctx, pool, "tenant_a", batch.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	seen := map[string]int{}
+	for _, line := range downloadLines(t, pool, *final.OutputFileID) {
+		seen[line.CustomID]++
+	}
+	for _, line := range downloadLines(t, pool, *final.ErrorFileID) {
+		seen[line.CustomID]++
+		if !strings.Contains(string(line.Error), "batch_expired") {
+			t.Errorf("errors line for %s should say batch_expired: %s", line.CustomID, line.Error)
+		}
+	}
+	for i := range 200 {
+		if customID := fmt.Sprintf("a-%d", i); seen[customID] != 1 {
+			t.Errorf("%s appears %d times across both files, want exactly once", customID, seen[customID])
+		}
+	}
+	t.Logf("%d finished before the deadline, %d expired; expired %s after the deadline", succeeded, expired, expiredAfter)
+}

@@ -37,6 +37,13 @@ func CreateTenant(t *testing.T, pool *pgxpool.Pool, tenantID string) {
 // it. The batch starts in validating, as after POST /v1/batches.
 func CreateBatch(t *testing.T, pool *pgxpool.Pool, tenantID, prefix string, lineCount int) batches.Batch {
 	t.Helper()
+	return CreateBatchWithWindow(t, pool, tenantID, prefix, lineCount, 24*time.Hour)
+}
+
+// CreateBatchWithWindow is CreateBatch with a chosen completion window, for
+// tests that need a batch to expire soon.
+func CreateBatchWithWindow(t *testing.T, pool *pgxpool.Pool, tenantID, prefix string, lineCount int, window time.Duration) batches.Batch {
+	t.Helper()
 	ctx := context.Background()
 	CreateTenant(t, pool, tenantID)
 
@@ -61,8 +68,8 @@ func CreateBatch(t *testing.T, pool *pgxpool.Pool, tenantID, prefix string, line
 		TenantID:         tenantID,
 		InputFileID:      file.ID,
 		Endpoint:         files.ChatCompletionsURL,
-		CompletionWindow: "24h",
-		WindowLength:     24 * time.Hour,
+		CompletionWindow: window.String(),
+		WindowLength:     window,
 		RequestTotal:     file.LineCount,
 	})
 	if err != nil {

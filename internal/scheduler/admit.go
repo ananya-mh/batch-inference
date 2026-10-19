@@ -49,14 +49,16 @@ func (s *Scheduler) admit(ctx context.Context, tx pgx.Tx) (int, error) {
 }
 
 // pickOldestFirst returns up to limit pending requests of in-progress
-// batches, oldest first, whichever tenant they belong to. This is first come,
-// first served; fair picking comes with Progress item 9.
+// batches that are not past their deadline, oldest first, whichever tenant
+// they belong to. This is first come, first served; fair picking comes with
+// Progress item 9.
 func pickOldestFirst(ctx context.Context, tx pgx.Tx, limit int) ([]requestKey, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT r.batch_id, r.custom_id
 		FROM requests r
 		JOIN batches b ON b.id = r.batch_id
 		WHERE r.status = $1 AND b.status = $2
+		  AND b.expires_at > clock_timestamp()
 		ORDER BY r.seq
 		LIMIT $3`,
 		requests.StatusPending, batches.StatusInProgress, limit,

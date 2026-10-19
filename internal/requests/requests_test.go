@@ -266,3 +266,52 @@ func TestGiveUpFailsQueuedRequest(t *testing.T) {
 		t.Errorf("status = %s, want failed", status)
 	}
 }
+
+// passDeadline moves the batch's deadline into the past, by the database clock.
+func passDeadline(t *testing.T, pool *pgxpool.Pool, batchID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		"UPDATE batches SET expires_at = clock_timestamp() - interval '1 second' WHERE id = $1", batchID); err != nil {
+		t.Fatalf("pass deadline: %v", err)
+	}
+}
+
+// TestStartRefusesAfterDeadline checks nothing starts once the deadline has
+// passed, even before the scheduler has marked the batch expired.
+func TestStartRefusesAfterDeadline(t *testing.T) {
+	t.Parallel()
+	pool, batchID := setupQueuedRequest(t)
+	passDeadline(t, pool, batchID)
+
+	inTx(t, pool, func(tx pgx.Tx) {
+		if _, started, err := requests.Start(context.Background(), tx, batchID, "r-0"); err != nil || started {
+			t.Errorf("Start = started %v, err %v; want not started", started, err)
+		}
+	})
+	if status := requestStatus(t, pool, batchID); status != requests.StatusQueued {
+		t.Errorf("status = %s, want still queued (the scheduler will expire it)", status)
+	}
+}
+
+// TestFinishRefusesAfterDeadline checks a result arriving after the deadline
+// is dropped, even before the scheduler has marked the batch expired.
+func TestFinishRefusesAfterDeadline(t *testing.T) {
+	t.Parallel()
+	pool, batchID := setupQueuedRequest(t)
+	ctx := context.Background()
+	inTx(t, pool, func(tx pgx.Tx) {
+		if _, _, err := requests.Start(ctx, tx, batchID, "r-0"); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	})
+	passDeadline(t, pool, batchID)
+
+	inTx(t, pool, func(tx pgx.Tx) {
+		if saved, err := requests.Finish(ctx, tx, batchID, "r-0", successOutcome); err != nil || saved {
+			t.Errorf("Finish after deadline: saved = %v, err = %v; want not saved", saved, err)
+		}
+	})
+	if count := countResults(t, pool, batchID); count != 0 {
+		t.Errorf("%d results saved after the deadline, want 0", count)
+	}
+}

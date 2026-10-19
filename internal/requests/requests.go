@@ -76,14 +76,21 @@ func CreateForBatch(ctx context.Context, tx pgx.Tx, batchID string, status Statu
 // Start is the worker's start check, run inside tx. If the request may run,
 // it moves it to running and returns its request body with started = true.
 // It returns started = false when the request must not run: its batch is no
-// longer in progress (cancelled or expired), or it has already finished.
+// longer in progress (cancelled or expired), its deadline has passed, or it
+// has already finished.
 func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.RawMessage, started bool, err error) {
 	// FOR SHARE locks the batch row against status changes until tx ends.
 	// Cancel has to wait for start checks happening right now, and any
 	// start check after cancel commits sees the new status, so once cancel
 	// returns, no request can start (guarantee 3).
+	//
+	// The deadline is compared with the database's clock, not this server's,
+	// so every server agrees on it.
 	var batchStatus batches.Status
-	err = tx.QueryRow(ctx, "SELECT status FROM batches WHERE id = $1 FOR SHARE", batchID).Scan(&batchStatus)
+	var overdue bool
+	err = tx.QueryRow(ctx,
+		"SELECT status, expires_at <= clock_timestamp() FROM batches WHERE id = $1 FOR SHARE", batchID,
+	).Scan(&batchStatus, &overdue)
 	if err != nil {
 		return nil, false, fmt.Errorf("read batch %s status: %w", batchID, err)
 	}
@@ -96,7 +103,9 @@ func Start(ctx context.Context, tx pgx.Tx, batchID, customID string) (body json.
 		}
 		return nil, false, nil
 	}
-	if batchStatus != batches.StatusInProgress {
+	// Past the deadline nothing new starts, even before the scheduler's next
+	// pass marks the batch expired; that pass will expire this request.
+	if batchStatus != batches.StatusInProgress || overdue {
 		return nil, false, nil
 	}
 
@@ -182,15 +191,18 @@ func readRequestBody(ctx context.Context, tx pgx.Tx, batchID string, lineNumber 
 }
 
 // Finish saves a running request's outcome inside tx. saved is false when the
-// request was no longer running, because another attempt already finished it
-// or its batch expired; then nothing is saved.
+// request was no longer running (another attempt already finished it, or its
+// batch expired), or when the batch's deadline has passed: a late result is
+// dropped, and the scheduler's next pass will expire the request. Then
+// nothing is saved.
 func Finish(ctx context.Context, tx pgx.Tx, batchID, customID string, outcome Outcome) (saved bool, err error) {
 	return finishFrom(ctx, tx, batchID, customID, outcome, StatusRunning)
 }
 
 // GiveUp saves a failed outcome for a request that is still in flight
 // (queued or running) but whose River job has ended without saving anything,
-// for example because the worker crashed on every attempt.
+// for example because the worker crashed on every attempt. Like Finish, it
+// saves nothing once the deadline has passed; the request will expire.
 func GiveUp(ctx context.Context, tx pgx.Tx, batchID, customID string, outcome Outcome) (saved bool, err error) {
 	return finishFrom(ctx, tx, batchID, customID, outcome, StatusQueued, StatusRunning)
 }
@@ -212,9 +224,14 @@ func finishFrom(ctx context.Context, tx pgx.Tx, batchID, customID string, outcom
 	// same way, so a request ends up finished or expired, never both. The
 	// row lock taken here makes a racing attempt wait, then find the
 	// status changed and save nothing (guarantee 2).
+	//
+	// The deadline check uses the database's clock: a result that arrives
+	// after expires_at is late and dropped, even if the expiry step has not
+	// run yet (guarantee 5).
 	tag, err := tx.Exec(ctx, `
 		UPDATE requests SET status = $3, finished_at = clock_timestamp()
-		WHERE batch_id = $1 AND custom_id = $2 AND status = ANY($4)`,
+		WHERE batch_id = $1 AND custom_id = $2 AND status = ANY($4)
+		  AND EXISTS (SELECT 1 FROM batches WHERE id = $1 AND expires_at > clock_timestamp())`,
 		batchID, customID, finalStatus, fromStatuses,
 	)
 	if err != nil {
