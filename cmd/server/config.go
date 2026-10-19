@@ -76,6 +76,9 @@ func readConfig() (config, error) {
 	if cfg.scheduler.PassInterval, err = envDuration("SCHEDULER_INTERVAL", 200*time.Millisecond); err != nil {
 		return config{}, err
 	}
+	if cfg.scheduler.FairScheduling, err = envBool("FAIR_SCHEDULING", true); err != nil {
+		return config{}, err
+	}
 
 	if err := cfg.check(); err != nil {
 		return config{}, err
@@ -128,6 +131,19 @@ func envInt64(name string, fallback int64) (int64, error) {
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be a whole number, got %q", name, value)
+	}
+	return parsed, nil
+}
+
+// envBool returns the variable as true or false, or fallback if it is not set.
+func envBool(name string, fallback bool) (bool, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false, got %q", name, value)
 	}
 	return parsed, nil
 }

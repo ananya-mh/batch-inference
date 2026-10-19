@@ -1,8 +1,8 @@
 # batch-inference
 
-A multi-tenant batch inference service in Go. Upload a file of AI requests, and the service runs them in the background on a shared model and gives back a results file. It follows the [OpenAI Batch API](https://platform.openai.com/docs/guides/batch), so the official OpenAI SDKs work against it unchanged, and it can send work to any OpenAI-compatible model server (vLLM, Ollama, or a hosted provider). It is built to never lose work, never save a result twice, and survive crashes, and (next on the list) to be fair across tenants.
+A multi-tenant batch inference service in Go. Upload a file of AI requests, and the service runs them in the background on a shared model and gives back a results file. It follows the [OpenAI Batch API](https://platform.openai.com/docs/guides/batch), so the official OpenAI SDKs work against it unchanged, and it can send work to any OpenAI-compatible model server (vLLM, Ollama, or a hosted provider). It is built to be fair across tenants, never lose work, never save a result twice, and survive crashes.
 
-**Status:** work in progress. Done: files, batches, workers, results files, cancel, and expiry. Still to come: fair scheduling across tenants, Prometheus metrics, CI, the load test and noisy-neighbor experiment, and a run on a real GPU.
+**Status:** work in progress. Done: files, batches, workers, results files, cancel, expiry, and fair scheduling across tenants. Still to come: Prometheus metrics, CI, the full-size load test, and a run on a real GPU.
 
 ## Run it
 
@@ -57,7 +57,8 @@ Results come back in two files, in OpenAI's format: `output_file_id` (successful
 ## How it works
 
 - **Postgres holds everything**: uploaded files (one row per line), batches, requests, results, and the job queue ([River](https://riverqueue.com)).
-- **A batch's lines wait in a `requests` table**, not all in the queue at once. A scheduler keeps a fixed number of them (the window, default 32) in River at a time and refills slots as requests finish. This is what will let a small batch from one tenant get a turn while another tenant's huge batch is running (fair scheduling is the next step).
+- **A batch's lines wait in a `requests` table**, not all in the queue at once. A scheduler keeps a fixed number of them (the window, default 32) in River at a time and refills slots as requests finish.
+- **Fair scheduling:** each free slot goes to the tenant with the fewest requests in flight (ties: whoever's oldest request has waited longest). A tenant alone gets the whole window; when a second tenant arrives, freed slots go to it until both have an equal share. So a small batch gets going within a fraction of a second even while another tenant's huge batch is running, instead of waiting for all of it.
 - **Workers** call the model, read the *whole* reply before trusting it (a reply cut off midway is a failed attempt, never a result), and retry temporary failures quickly (1, 2, 4, 8 seconds; up to 5 attempts).
 - **Statuses only change by compare-and-set** (`UPDATE ... WHERE status = <expected>`), so when two things race (cancel against finishing, expiry against cancel, two servers at once) exactly one wins.
 
@@ -68,7 +69,7 @@ Results come back in two files, in OpenAI's format: `output_file_id` (successful
 | **No lost work.** A request whose worker crashes is retried. | Each request's job stays in Postgres; River rescues jobs left running by a dead worker. A job that dies on every attempt is failed with a reason, never left hanging. | `TestStuckJobIsRescuedByRiver`, `TestRetryAfterCrashedAttemptFinishes`, `TestRequestOfDeadJobIsGivenUp`, `TestFinalizingSurvivesCrash`, `scripts/crash-test.sh` |
 | **No duplicate results.** Each result is saved once, keyed by `batch_id + custom_id`. | Saving moves the request out of `running` by compare-and-set, so only one attempt can save; the results table's primary key backs it up. | `TestSameRequestRunTwiceSavesOneResult`, `TestConcurrentFinishSavesOnlyOnce`, `TestTwoSchedulersNeverOverfillWindow` |
 | **Cancel works.** After cancel, no new requests from that batch start. | Cancel and the worker's start check lock the batch row against each other; requests not yet running are cancelled at once and their slots freed. | `TestCancelMidBatch`, `TestCancelInProgressBatch`, `TestStartCancelsRequestOfCancellingBatch`, `TestCancelAndFinalizeRace` |
-| **Fairness.** A tenant with a huge batch cannot block a tenant with a small one. | *Next: Progress item 9.* | *To come.* |
+| **Fairness.** A tenant with a huge batch cannot block a tenant with a small one. | Free slots go to the tenant with the fewest requests in flight, so a newly arriving tenant gets slots as soon as any free up. | `TestSmallTenantNotBlockedByBigBatch`, `TestArrivingTenantGetsFreedSlots`, `TestLoneTenantGetsWholeWindow`, `TestNewTenantGetsFreedSlots`, `scripts/fairness-experiment.sh` |
 | **Expiry works.** Unfinished requests are marked expired when the window ends. | Deadlines are checked against the database's clock; at the deadline, unfinished requests expire and late results are dropped. | `TestExpiryMidBatch`, `TestOverdueBatchExpires`, `TestExpiryAndLastResultRace`, `TestExpiryAndCancelRace`, `scripts/crash-test.sh --expiry` |
 
 ## Crash tests
@@ -119,18 +120,37 @@ The `--expiry` variant gives the batch a 30-second completion window and keeps t
 
 For these tests the server rescues jobs of a dead worker after 20 seconds instead of the usual 5 minutes.
 
-## Measurements so far
+## Fairness experiment (noisy neighbor)
 
-All with the fake model on a laptop (Docker Desktop, 10 CPUs), 16 workers, window of 32.
+Tenant A submits one big batch; 5 seconds later tenants B, C and D each submit a small one. The same scenario runs with fair scheduling and with first come, first served, 5 times each, under identical conditions: same input files, same arrival timing, and the same fake model seed (so every request gets the same delay and the same errors in every run; the fake model is restarted before each run). Settings as in `compose.yaml`: 16 workers, a window of 32, fake model at 50–500 ms per request.
 
-| What | Result |
-|------|--------|
-| Upload a 92 MB, 440,000-line file | 2.1 s; server memory peaked at 54 MiB (the file is streamed, never held whole) |
-| Batch status (`GET /v1/batches/{id}`) on a 50,000-line batch | median 4–5 ms |
-| Write the 50,000-line results file | 0.55 s, inside Postgres |
-| Cancel → `cancelled` (32 requests in flight, model 50–500 ms) | 0.29–0.54 s, median 0.39 s (10 runs) |
-| Deadline → `expired` (server running) | 4–58 ms (5 batches) |
-| Overdue batch after a restart | expired in under 1 s |
+```sh
+scripts/fairness-experiment.sh                 # defaults: 3,000-request big batch, 3 x 100-request small ones
+BIG=50000 scripts/fairness-experiment.sh       # the full-size experiment (not yet run)
+```
+
+A real run (`RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 scripts/fairness-experiment.sh`), median [min–max] over the 5 runs, in seconds unless noted:
+
+| Metric | Fair scheduling | First come, first served |
+|---|---|---|
+| Small tenants: all done (slowest of B, C, D) | 9.16 [9.14–9.18] | 66.85 [65.65–67.44] |
+| Small tenants: per-request wait, p50 | 4.48 [4.44–4.57] | 62.11 [61.99–62.15] |
+| Small tenants: per-request wait, p99 | 8.61 [8.58–8.62] | 65.2 [65.02–65.24] |
+| Small tenants: wait for first slot (slowest) | 0.09 [0.06–0.09] | 62.72 [62.71–62.82] |
+| Big tenant: done | 73.35 [73.14–73.55] | 67.01 [66.99–67.22] |
+| Total throughput (requests/s) | 45 [44.9–45.1] | 45.9 [45.5–46.7] |
+
+Per-request wait is from the small batch's creation until that request's model call started. Jobs retried per run (same seed, so this should match across runs): 92, 92, 92, 92, 92, 92, 92, 92, 92, 92.
+
+```
+Median time until done (seconds)
+small, fair      9.2  #####
+small, fifo     66.8  ####################################
+big,   fair     73.3  ########################################
+big,   fifo     67.0  ####################################
+```
+
+What it shows: with fair scheduling the small tenants get their first slot within 0.1 s and finish in about 9 s; first come, first served makes them wait about 63 s for the big batch to get out of the way. The cost is that the big batch finishes about 6 s (9%) later, since it shares the window. Total throughput came out about 2% lower with fair scheduling in this run; I haven't pinned down why yet.
 
 ## Settings
 
@@ -141,6 +161,7 @@ All with the fake model on a laptop (Docker Desktop, 10 CPUs), 16 workers, windo
 | `MODEL_API_KEY` | (none) | Only needed for hosted providers |
 | `WORKERS` | 16 | Requests sent to the model at once |
 | `SCHEDULER_WINDOW` | 2 × `WORKERS` | Most requests in the queue at once |
+| `FAIR_SCHEDULING` | `true` | `false` = first come, first served (the experiment's baseline) |
 | `MAX_ATTEMPTS` | 5 | Tries per request |
 | `JOB_TIMEOUT` | 2m | Longest one model call may take |
 | `COMPLETION_WINDOWS` | `24h` | Allowed completion windows (tests add short ones like `10s`) |

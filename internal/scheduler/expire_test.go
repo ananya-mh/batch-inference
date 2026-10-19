@@ -316,6 +316,15 @@ func TestExpiryAndLastResultRace(t *testing.T) {
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM results WHERE batch_id = $1", batch.ID).Scan(&resultRows); err != nil {
 			t.Fatalf("count results: %v", err)
 		}
+		// A batch that ended completed must never have been expired on the
+		// way: expired_at stays unset.
+		var everExpired bool
+		if err := pool.QueryRow(ctx, "SELECT expired_at IS NOT NULL FROM batches WHERE id = $1", batch.ID).Scan(&everExpired); err != nil {
+			t.Fatalf("read expired_at: %v", err)
+		}
+		if status == batches.StatusCompleted && everExpired {
+			t.Fatalf("round %d: batch completed but has an expired_at", round)
+		}
 		switch {
 		case saved && requestStatus == "succeeded" && resultRows == 1 && status == batches.StatusCompleted:
 			outcomes["result in time, completed"]++
@@ -327,4 +336,113 @@ func TestExpiryAndLastResultRace(t *testing.T) {
 		}
 	}
 	t.Logf("outcomes over 30 rounds: %v", outcomes)
+}
+
+// TestUndoneExpiryIsNeverVisible reproduces, step by step, the case where a
+// worker's save passes the deadline check just before the deadline but
+// commits just after the expiry pass has started. Expiry must undo itself
+// inside its own transaction: a watcher reading the batch's status the
+// whole time must never see "expired", and the batch must end completed.
+func TestUndoneExpiryIsNeverVisible(t *testing.T) {
+	t.Parallel()
+	pool := testdb.New(t)
+	ctx := context.Background()
+	batch := testfixtures.CreateBatch(t, pool, "tenant_a", "a", 1)
+	s := newScheduler(t, pool, 4)
+	runPass(t, s)
+	exec(t, pool, "UPDATE requests SET status = 'running' WHERE batch_id = $1", batch.ID)
+	exec(t, pool, "UPDATE batches SET expires_at = clock_timestamp() + interval '300 milliseconds' WHERE id = $1", batch.ID)
+
+	// 1. The worker saves before the deadline, but does not commit yet. It
+	// now holds the request's row lock.
+	saveTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin save: %v", err)
+	}
+	defer database.RollbackUnlessCommitted(ctx, saveTx)
+	saved, err := requests.Finish(ctx, saveTx, batch.ID, "a-0", requests.Outcome{Succeeded: true, Response: []byte(`{}`)})
+	if err != nil || !saved {
+		t.Fatalf("save before the deadline: saved %v, err %v", saved, err)
+	}
+
+	// Watch the batch's status from another connection the whole time. The
+	// watcher reports back instead of failing the test itself, and is always
+	// stopped before the test returns.
+	stopWatching := make(chan struct{})
+	type watchResult struct {
+		sawExpired bool
+		err        error
+	}
+	watched := make(chan watchResult, 1)
+	go func() {
+		var result watchResult
+		defer func() { watched <- result }()
+		for {
+			select {
+			case <-stopWatching:
+				return
+			default:
+			}
+			var status batches.Status
+			if err := pool.QueryRow(ctx, "SELECT status FROM batches WHERE id = $1", batch.ID).Scan(&status); err != nil {
+				result.err = err
+				return
+			}
+			if status == batches.StatusExpired {
+				result.sawExpired = true
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	watcherStopped := false
+	stopWatcher := func() watchResult {
+		if !watcherStopped {
+			close(stopWatching)
+			watcherStopped = true
+		}
+		return <-watched
+	}
+	defer func() {
+		if !watcherStopped {
+			stopWatcher()
+		}
+	}()
+
+	// 2. After the deadline, an expiry pass starts. It sees the request as
+	// running and blocks on the row lock the save holds.
+	time.Sleep(400 * time.Millisecond)
+	passDone := make(chan error, 1)
+	go func() {
+		result, err := s.RunPass(ctx)
+		if err == nil && result.Expired != 0 {
+			err = fmt.Errorf("pass expired %d batches, want 0 (it must undo)", result.Expired)
+		}
+		passDone <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	// 3. The save commits; the pass finds nothing left to expire.
+	if err := saveTx.Commit(ctx); err != nil {
+		t.Fatalf("commit save: %v", err)
+	}
+	if err := <-passDone; err != nil {
+		t.Fatalf("expiry pass: %v", err)
+	}
+	runPass(t, s) // to finalizing
+	runPass(t, s) // to completed
+
+	watch := stopWatcher()
+	if watch.err != nil {
+		t.Fatalf("watcher: %v", watch.err)
+	}
+	if watch.sawExpired {
+		t.Error("the watcher saw the batch as expired at some point")
+	}
+	final, err := batches.Get(ctx, pool, "tenant_a", batch.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.Status != batches.StatusCompleted || final.ExpiredAt != nil {
+		t.Errorf("batch = %s, expired_at %v; want completed, never expired", final.Status, final.ExpiredAt)
+	}
 }

@@ -81,7 +81,8 @@ func run() error {
 		sched.Run(schedulerCtx)
 	}()
 	slog.Info("workers and scheduler started",
-		"workers", cfg.worker.Workers, "window", cfg.scheduler.Window, "model", cfg.modelBaseURL)
+		"workers", cfg.worker.Workers, "window", cfg.scheduler.Window,
+		"fair", cfg.scheduler.FairScheduling, "model", cfg.modelBaseURL)
 
 	httpServer := &http.Server{
 		Addr:    cfg.httpAddr,

@@ -35,7 +35,11 @@ func (s *Scheduler) admit(ctx context.Context, tx pgx.Tx) (int, error) {
 		return 0, nil
 	}
 
-	picked, err := pickOldestFirst(ctx, tx, free)
+	pick := pickOldestFirst
+	if s.config.FairScheduling {
+		pick = pickFairly
+	}
+	picked, err := pick(ctx, tx, free)
 	if err != nil {
 		return 0, err
 	}
@@ -50,8 +54,8 @@ func (s *Scheduler) admit(ctx context.Context, tx pgx.Tx) (int, error) {
 
 // pickOldestFirst returns up to limit pending requests of in-progress
 // batches that are not past their deadline, oldest first, whichever tenant
-// they belong to. This is first come, first served; fair picking comes with
-// Progress item 9.
+// they belong to: first come, first served. It is used when fair scheduling
+// is off, as the baseline for the fairness experiment.
 func pickOldestFirst(ctx context.Context, tx pgx.Tx, limit int) ([]requestKey, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT r.batch_id, r.custom_id

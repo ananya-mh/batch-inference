@@ -41,10 +41,17 @@ func newRiverClient(t *testing.T, pool *pgxpool.Pool) *river.Client[pgx.Tx] {
 	return client
 }
 
-// newScheduler returns a scheduler with the given window.
+// newScheduler returns a first-come-first-served scheduler with the given
+// window.
 func newScheduler(t *testing.T, pool *pgxpool.Pool, window int) *scheduler.Scheduler {
 	t.Helper()
 	return scheduler.New(pool, newRiverClient(t, pool), scheduler.Config{Window: window, PassInterval: time.Hour})
+}
+
+// newFairScheduler returns a fair scheduler with the given window.
+func newFairScheduler(t *testing.T, pool *pgxpool.Pool, window int) *scheduler.Scheduler {
+	t.Helper()
+	return scheduler.New(pool, newRiverClient(t, pool), scheduler.Config{Window: window, PassInterval: time.Hour, FairScheduling: true})
 }
 
 // runPass runs one pass and fails the test on error.

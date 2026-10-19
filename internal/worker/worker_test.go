@@ -52,9 +52,15 @@ type system struct {
 	scheduler *scheduler.Scheduler
 }
 
-// newSystem builds the scheduler and River client against the model at
+// newSystem builds a fair scheduler and River client against the model at
 // modelURL. Neither is started; call start.
 func newSystem(t *testing.T, pool *pgxpool.Pool, modelURL string, config worker.Config) *system {
+	t.Helper()
+	return newSystemWithFairness(t, pool, modelURL, config, true)
+}
+
+// newSystemWithFairness is newSystem with fair scheduling on or off.
+func newSystemWithFairness(t *testing.T, pool *pgxpool.Pool, modelURL string, config worker.Config, fair bool) *system {
 	t.Helper()
 	sys := &system{pool: pool}
 	riverClient, err := worker.NewRiverClient(pool, model.NewClient(modelURL, ""), config, func() { sys.scheduler.Nudge() })
@@ -62,7 +68,7 @@ func newSystem(t *testing.T, pool *pgxpool.Pool, modelURL string, config worker.
 		t.Fatalf("NewRiverClient: %v", err)
 	}
 	sys.river = riverClient
-	sys.scheduler = scheduler.New(pool, riverClient, scheduler.Config{Window: 8, PassInterval: 20 * time.Millisecond})
+	sys.scheduler = scheduler.New(pool, riverClient, scheduler.Config{Window: 8, PassInterval: 20 * time.Millisecond, FairScheduling: fair})
 	return sys
 }
 
@@ -717,4 +723,67 @@ func TestExpiryMidBatch(t *testing.T) {
 		}
 	}
 	t.Logf("%d finished before the deadline, %d expired; expired %s after the deadline", succeeded, expired, expiredAfter)
+}
+
+// TestSmallTenantNotBlockedByBigBatch is the fairness guarantee end to end: a
+// big tenant's batch is running when a small tenant's batch arrives. With fair
+// scheduling the small batch finishes while most of the big batch is still
+// waiting. Without it (first come, first served), the small batch is stuck
+// behind the big one, which shows the test can tell the two apart.
+func TestSmallTenantNotBlockedByBigBatch(t *testing.T) {
+	t.Parallel()
+	for _, fair := range []bool{true, false} {
+		t.Run(map[bool]string{true: "fair", false: "first come first served"}[fair], func(t *testing.T) {
+			t.Parallel()
+			pool := testdb.New(t)
+			modelURL := startFakeModel(t, fakemodel.Config{MinDelay: 20 * time.Millisecond, MaxDelay: 40 * time.Millisecond, OutputWords: 3})
+			big := testfixtures.CreateBatch(t, pool, "tenant_big", "big", 300)
+			newSystemWithFairness(t, pool, modelURL, testWorkerConfig(), fair).start(t)
+
+			// Let the big batch fill the window before the small one arrives.
+			deadline := time.Now().Add(10 * time.Second)
+			for testfixtures.CountRequests(t, pool, big.ID)["succeeded"] < 20 {
+				if time.Now().After(deadline) {
+					t.Fatal("big batch made no progress")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			small := testfixtures.CreateBatch(t, pool, "tenant_small", "small", 20)
+
+			// Wait until the small batch is done, or until the big one is.
+			deadline = time.Now().Add(60 * time.Second)
+			var bigPending int
+			for {
+				smallDone := testfixtures.BatchStatus(t, pool, small.ID) == batches.StatusCompleted
+				bigCounts := testfixtures.CountRequests(t, pool, big.ID)
+				bigPending = bigCounts["pending"]
+				if smallDone || bigPending == 0 || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			var firstSlotWait *time.Duration // nil if the small batch never got a slot
+			err := pool.QueryRow(context.Background(), `
+				SELECT min(r.queued_at) - b.created_at
+				FROM requests r JOIN batches b ON b.id = r.batch_id
+				WHERE b.id = $1 GROUP BY b.created_at`, small.ID).Scan(&firstSlotWait)
+			if err != nil {
+				t.Fatalf("read first slot wait: %v", err)
+			}
+			firstSlot := "never"
+			if firstSlotWait != nil {
+				firstSlot = firstSlotWait.String()
+			}
+			t.Logf("small batch status %s with %d of 300 big requests still pending; first slot: %s",
+				testfixtures.BatchStatus(t, pool, small.ID), bigPending, firstSlot)
+
+			if fair && bigPending < 150 {
+				t.Errorf("fair: only %d of the big batch's requests were still pending when the small batch finished, want most (> 150)", bigPending)
+			}
+			if !fair && bigPending > 50 {
+				t.Errorf("first come first served: the small batch finished with %d big requests still pending; expected it to wait behind the big batch", bigPending)
+			}
+		})
+	}
 }

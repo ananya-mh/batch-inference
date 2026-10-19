@@ -32,6 +32,12 @@ type Config struct {
 
 	// PassInterval is how often a pass runs when nothing nudges it sooner.
 	PassInterval time.Duration
+
+	// FairScheduling picks requests fairly across tenants: each free slot
+	// goes to the tenant with the fewest requests in flight. When false,
+	// requests are picked first come, first served (the experiment's
+	// baseline).
+	FairScheduling bool
 }
 
 // Scheduler runs scheduling passes.
