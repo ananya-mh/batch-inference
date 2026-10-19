@@ -13,6 +13,8 @@
 #   SMALL=100         requests in each small tenant's batch
 #   SMALL_DELAY=5     seconds after the big batch that the small ones arrive
 #   SEED=42           fake model seed: same delays, errors and crashes per request
+#   ERROR_RATE=0.02   fake model error rate (compose.yaml's default)
+#   CRASH_RATE=0.01   fake model cut-off-reply rate (compose.yaml's default)
 #
 # Identical conditions: every run uses the same input files, the same arrival
 # timing, and the same fake model seed. The fake model and the server are
@@ -20,6 +22,11 @@
 # zero. Modes alternate (fair, fifo, fair, ...) so slow drift in the machine
 # does not favor one mode. The rest of the settings are compose.yaml's: 16
 # workers, a window of 32, and the fake model at 50-500 ms per request.
+#
+# Busy workers: during each run, the number of the run's River jobs that are
+# running (busy workers) and waiting for a retry is sampled about three times
+# a second, saved per run, and summarized as the average busy workers, idle
+# worker-seconds, and the average over the run's last 10 seconds.
 #
 # Output: a results table (median and range per mode), a bar chart, and the
 # per-run numbers, printed and saved under results/.
@@ -31,6 +38,9 @@ BIG=${BIG:-3000}
 SMALL=${SMALL:-100}
 SMALL_DELAY=${SMALL_DELAY:-5}
 SEED=${SEED:-42}
+ERROR_RATE=${ERROR_RATE:-0.02}
+CRASH_RATE=${CRASH_RATE:-0.01}
+WORKERS=16 # compose.yaml's setting; used for idle worker-seconds
 API=http://localhost:8080
 SMALL_TENANTS="b c d"
 
@@ -88,9 +98,44 @@ services:
   fakemodel:
     environment:
       FAKE_MODEL_SEED: "$SEED"
+      FAKE_MODEL_ERROR_RATE: "$ERROR_RATE"
+      FAKE_MODEL_CRASH_RATE: "$CRASH_RATE"
 EOF
 	docker compose -f compose.yaml -f "$WORK/settings.yaml" up -d --force-recreate --wait server fakemodel >"$WORK/compose.log" 2>&1 ||
 		{ cat "$WORK/compose.log"; exit 1; }
+}
+
+# Samples, until $WORK/stop-sampling exists, how many of run $1's River jobs
+# are running (busy workers) and waiting for a retry, appending
+# "epoch,busy,waiting_retry" lines to file $2.
+sample_workers() {
+	while [ ! -f "$WORK/stop-sampling" ]; do
+		sql "SELECT concat_ws(',', extract(epoch FROM clock_timestamp()),
+				count(*) FILTER (WHERE state = 'running'),
+				count(*) FILTER (WHERE state IN ('retryable', 'scheduled')))
+			FROM river_job
+			WHERE args->>'batch_id' IN (SELECT id FROM batches WHERE metadata->>'experiment' = '$1')" >>"$2"
+		sleep 0.1
+	done
+}
+
+# Summarizes a busy-workers file ($1) between epochs $2 (start) and $3 (end)
+# as "average busy,idle worker-seconds,average busy in the last 10 s",
+# treating each sample as holding until the next one.
+summarize_workers() {
+	sort -t, -k1,1g "$1" | awk -F, -v start="$2" -v end="$3" -v workers="$WORKERS" '
+		BEGIN { n = 0 }
+		$1 >= start && $1 <= end { t[n] = $1; busy[n] = $2; n++ }
+		END {
+			for (i = 0; i < n; i++) {
+				next_t = (i + 1 < n) ? t[i + 1] : end
+				dt = next_t - t[i]
+				total += busy[i] * dt; span += dt
+				idle += (workers - busy[i]) * dt
+				if (t[i] >= end - 10) { tail += busy[i] * dt; tail_span += dt }
+			}
+			printf "%.1f,%.0f,%.1f", (span > 0 ? total / span : 0), idle, (tail_span > 0 ? tail / tail_span : 0)
+		}'
 }
 
 # On exit, put the server and fake model back on their normal settings.
@@ -113,7 +158,7 @@ for tenant in $SMALL_TENANTS; do
 done
 echo "tenant a: $BIG requests; tenants $SMALL_TENANTS: $SMALL each; small ones arrive ${SMALL_DELAY}s later"
 
-echo "mode,run,small_completion_s,small_wait_p50_s,small_wait_p99_s,small_first_slot_s,big_completion_s,throughput_rps,arrival_gap_s,retried_jobs" >"$CSV"
+echo "mode,run,small_completion_s,small_wait_p50_s,small_wait_p99_s,small_first_slot_s,big_completion_s,throughput_rps,arrival_gap_s,retried_jobs,busy_workers_mean,idle_worker_s,busy_workers_last10s" >"$CSV"
 
 for run in $(seq 1 "$RUNS"); do
 	for mode in fair fifo; do
@@ -122,11 +167,21 @@ for run in $(seq 1 "$RUNS"); do
 		restart_stack "$([ "$mode" = fair ] && echo true || echo false)"
 
 		BATCHES=$(create_batch a "$BIG_FILE" "$TAG" big)
+		rm -f "$WORK/stop-sampling"
+		WORKERS_FILE="$OUT/workers-$mode-$run.csv"
+		sample_workers "$TAG" "$WORKERS_FILE" &
+		SAMPLER=$!
 		sleep "$SMALL_DELAY"
+		# Wait only for these requests: a bare "wait" would also wait for the
+		# sampler, which runs until the batches are done.
+		CREATORS=""
 		for tenant in $SMALL_TENANTS; do
 			create_batch "$tenant" "$(cat "$WORK/$tenant.file")" "$TAG" small >"$WORK/$tenant.id" &
+			CREATORS="$CREATORS $!"
 		done
-		wait
+		for pid in $CREATORS; do
+			wait "$pid"
+		done
 		for tenant in $SMALL_TENANTS; do
 			BATCHES="$BATCHES $(cat "$WORK/$tenant.id")"
 		done
@@ -137,6 +192,8 @@ for run in $(seq 1 "$RUNS"); do
 			[ "$LEFT" -eq 0 ] && break
 			sleep 1
 		done
+		touch "$WORK/stop-sampling"
+		wait "$SAMPLER"
 		[ "$LEFT" -eq 0 ] || { echo "run $TAG did not finish"; exit 1; }
 
 		# All metrics in seconds, from the database's own timestamps.
@@ -159,8 +216,11 @@ for run in $(seq 1 "$RUNS"); do
 					extract(epoch FROM (SELECT max(completed_at) FROM b) - (SELECT min(created_at) FROM b)))::numeric, 1),
 				round((SELECT extract(epoch FROM min(s.created_at) - (SELECT created_at FROM big)) FROM small s)::numeric, 2),
 				(SELECT count(*) FROM river_job WHERE args->>'batch_id' IN (SELECT id FROM b) AND attempt > 1))")
-		echo "$mode,$run,$ROW" >>"$CSV"
-		echo "$ROW" | awk -F, '{printf "small tenants done after %ss (per-request wait p50 %ss, p99 %ss; first slot after %ss); big done after %ss; %s req/s; %s jobs retried\n", $1, $2, $3, $4, $5, $6, $8}'
+		RUN_START=$(sql "SELECT extract(epoch FROM min(created_at)) FROM batches WHERE metadata->>'experiment' = '$TAG'")
+		RUN_END=$(sql "SELECT extract(epoch FROM max(completed_at)) FROM batches WHERE metadata->>'experiment' = '$TAG'")
+		WORKER_STATS=$(summarize_workers "$WORKERS_FILE" "$RUN_START" "$RUN_END")
+		echo "$mode,$run,$ROW,$WORKER_STATS" >>"$CSV"
+		echo "$ROW,$WORKER_STATS" | awk -F, '{printf "small tenants done after %ss (per-request wait p50 %ss, p99 %ss; first slot after %ss); big done after %ss; %s req/s; %s jobs retried; busy workers %s on average, %s in the last 10 s\n", $1, $2, $3, $4, $5, $6, $8, $9, $11}'
 	done
 done
 
@@ -187,26 +247,30 @@ bar() {
 {
 	echo "## Fairness experiment"
 	echo
-	echo "Command: \`RUNS=$RUNS BIG=$BIG SMALL=$SMALL SMALL_DELAY=$SMALL_DELAY SEED=$SEED scripts/fairness-experiment.sh\`"
+	echo "Command: \`RUNS=$RUNS BIG=$BIG SMALL=$SMALL SMALL_DELAY=$SMALL_DELAY SEED=$SEED ERROR_RATE=$ERROR_RATE CRASH_RATE=$CRASH_RATE scripts/fairness-experiment.sh\`"
 	echo
-	echo "Tenant A: one batch of $BIG requests. Tenants B, C, D: one batch of $SMALL requests each, arriving ${SMALL_DELAY}s later."
-	echo "$RUNS runs per mode, same seed and arrival timing; values are median [min–max] over the runs, in seconds unless noted."
+	echo "Tenant A: one batch of $BIG requests. Tenants B, C, D: one batch of $SMALL requests each, submitted ${SMALL_DELAY}s after A's."
+	echo "Fake model: 50–500 ms per request, error rate $ERROR_RATE, cut-off-reply rate $CRASH_RATE, seed $SEED. $WORKERS workers, window of 32."
+	echo "$RUNS runs per mode, same seed and arrival timing; values are median [min–max] over the runs."
+	echo "Every time is measured from that tenant's own submission (when its batch was created), in seconds."
 	echo
 	echo "| Metric | Fair scheduling | First come, first served |"
 	echo "|---|---|---|"
-	echo "| Small tenants: all done (slowest of B, C, D) | $(summarize 3 fair) | $(summarize 3 fifo) |"
-	echo "| Small tenants: per-request wait, p50 | $(summarize 4 fair) | $(summarize 4 fifo) |"
-	echo "| Small tenants: per-request wait, p99 | $(summarize 5 fair) | $(summarize 5 fifo) |"
-	echo "| Small tenants: wait for first slot (slowest) | $(summarize 6 fair) | $(summarize 6 fifo) |"
-	echo "| Big tenant: done | $(summarize 7 fair) | $(summarize 7 fifo) |"
-	echo "| Total throughput (requests/s) | $(summarize 8 fair) | $(summarize 8 fifo) |"
+	echo "| Small tenants: batch done, from its submission (slowest of B, C, D) | $(summarize 3 fair) | $(summarize 3 fifo) |"
+	echo "| Small tenants: wait from submission until a request's model call starts, p50 | $(summarize 4 fair) | $(summarize 4 fifo) |"
+	echo "| Small tenants: same wait, p99 | $(summarize 5 fair) | $(summarize 5 fifo) |"
+	echo "| Small tenants: wait from submission until the first request gets a slot (slowest) | $(summarize 6 fair) | $(summarize 6 fifo) |"
+	echo "| Big tenant: batch done, from its submission | $(summarize 7 fair) | $(summarize 7 fifo) |"
+	echo "| Total throughput: all requests / (last batch done − first batch submitted), requests/s | $(summarize 8 fair) | $(summarize 8 fifo) |"
+	echo "| Busy workers, average over the run (of $WORKERS) | $(summarize 11 fair) | $(summarize 11 fifo) |"
+	echo "| Idle worker-seconds over the run | $(summarize 12 fair) | $(summarize 12 fifo) |"
+	echo "| Busy workers, average over the last 10 s of the run | $(summarize 13 fair) | $(summarize 13 fifo) |"
 	echo
-	echo "Per-request wait = from the small batch's creation until that request's model call started."
 	echo "Jobs retried per run (same seed, so this should match across runs): $(awk -F, 'NR > 1 { printf "%s%s", sep, $10; sep = ", " }' "$CSV")."
 	echo
 	MAX=$(awk -F, 'NR > 1 { if ($7 > m) m = $7; if ($3 > m) m = $3 } END { print m }' "$CSV")
 	echo '```'
-	echo "Median time until done (seconds)"
+	echo "Median time from submission until done (seconds)"
 	printf "small, fair  %7.1f  %s\n" "$(median 3 fair)" "$(bar "$(median 3 fair)" "$MAX")"
 	printf "small, fifo  %7.1f  %s\n" "$(median 3 fifo)" "$(bar "$(median 3 fifo)" "$MAX")"
 	printf "big,   fair  %7.1f  %s\n" "$(median 7 fair)" "$(bar "$(median 7 fair)" "$MAX")"

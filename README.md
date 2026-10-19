@@ -129,28 +129,74 @@ scripts/fairness-experiment.sh                 # defaults: 3,000-request big bat
 BIG=50000 scripts/fairness-experiment.sh       # the full-size experiment (not yet run)
 ```
 
-A real run (`RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 scripts/fairness-experiment.sh`), median [min–max] over the 5 runs, in seconds unless noted:
+A real run, `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0.02 CRASH_RATE=0.01 scripts/fairness-experiment.sh`:
+
+Tenant A: one batch of 3000 requests. Tenants B, C, D: one batch of 100 requests each, submitted 5s after A's.
+Fake model: 50–500 ms per request, error rate 0.02, cut-off-reply rate 0.01, seed 42. 16 workers, window of 32.
+5 runs per mode, same seed and arrival timing; values are median [min–max] over the runs.
+Every time is measured from that tenant's own submission (when its batch was created), in seconds.
 
 | Metric | Fair scheduling | First come, first served |
 |---|---|---|
-| Small tenants: all done (slowest of B, C, D) | 9.16 [9.14–9.18] | 66.85 [65.65–67.44] |
-| Small tenants: per-request wait, p50 | 4.48 [4.44–4.57] | 62.11 [61.99–62.15] |
-| Small tenants: per-request wait, p99 | 8.61 [8.58–8.62] | 65.2 [65.02–65.24] |
-| Small tenants: wait for first slot (slowest) | 0.09 [0.06–0.09] | 62.72 [62.71–62.82] |
-| Big tenant: done | 73.35 [73.14–73.55] | 67.01 [66.99–67.22] |
-| Total throughput (requests/s) | 45 [44.9–45.1] | 45.9 [45.5–46.7] |
+| Small tenants: batch done, from its submission (slowest of B, C, D) | 9.17 [9.05–9.18] | 66.04 [65.23–66.07] |
+| Small tenants: wait from submission until a request's model call starts, p50 | 4.48 [4.47–4.49] | 61.56 [61.46–61.71] |
+| Small tenants: same wait, p99 | 8.61 [8.51–8.61] | 64.68 [64.53–64.73] |
+| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.07 [0.04–0.08] | 62.23 [62.17–62.32] |
+| Big tenant: batch done, from its submission | 73.52 [73.32–73.72] | 66.8 [66.65–66.82] |
+| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 44.9 [44.8–45] | 46.4 [46.4–47] |
+| Busy workers, average over the run (of 16) | 13.1 [13–13.1] | 13.5 [13.4–13.7] |
+| Idle worker-seconds over the run | 215 [213–218] | 174 [164–185] |
+| Busy workers, average over the last 10 s of the run | 9 [8.5–9.2] | 12.5 [12.1–13.1] |
 
-Per-request wait is from the small batch's creation until that request's model call started. Jobs retried per run (same seed, so this should match across runs): 92, 92, 92, 92, 92, 92, 92, 92, 92, 92.
+Jobs retried per run (same seed, so this should match across runs): 92, 92, 92, 92, 92, 92, 92, 92, 92, 92.
 
 ```
-Median time until done (seconds)
+Median time from submission until done (seconds)
 small, fair      9.2  #####
-small, fifo     66.8  ####################################
-big,   fair     73.3  ########################################
-big,   fifo     67.0  ####################################
+small, fifo     66.0  ####################################
+big,   fair     73.5  ########################################
+big,   fifo     66.8  ####################################
 ```
 
-What it shows: with fair scheduling the small tenants get their first slot within 0.1 s and finish in about 9 s; first come, first served makes them wait about 63 s for the big batch to get out of the way. The cost is that the big batch finishes about 6 s (9%) later, since it shares the window. Total throughput came out about 2% lower with fair scheduling in this run; I haven't pinned down why yet.
+What it shows: with fair scheduling the small tenants get their first slot within 0.1 s of submitting and finish about 9 s after submitting; first come, first served makes them wait about 62 s for the big batch to get out of the way. The cost is that the big batch finishes about 7 s (10%) later, since it shares the window. Total throughput is about 3% lower with fair scheduling in this run; the next section explains why.
+
+### Investigating the throughput gap
+
+The hypothesis: with fair scheduling the big tenant finishes last, so its final retries hold slots during their backoff while the other workers sit idle. Two checks.
+
+**(a) Turn errors and cut-off replies off.** If retries cause the gap, it should disappear. It does: throughput is the same in both modes. From `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0 CRASH_RATE=0 scripts/fairness-experiment.sh`:
+
+| Metric | Fair scheduling | First come, first served |
+|---|---|---|
+| Small tenants: batch done, from its submission (slowest of B, C, D) | 8.84 [8.84–8.97] | 63.25 [63.24–63.26] |
+| Small tenants: wait from submission until a request's model call starts, p50 | 4.26 [4.26–4.32] | 59.6 [59.56–59.63] |
+| Small tenants: same wait, p99 | 8.29 [8.19–8.39] | 62.65 [62.59–62.66] |
+| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.03 [0.01–0.03] | 60.31 [60.18–60.37] |
+| Big tenant: batch done, from its submission | 68.31 [68.12–68.33] | 62.01 [61.95–62.03] |
+| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 48.3 [48.3–48.4] | 48.3 [48.3–48.3] |
+| Busy workers, average over the run (of 16) | 13.4 [13.3–13.5] | 13.5 [13.4–13.5] |
+| Idle worker-seconds over the run | 178 [167–181] | 172 [171–179] |
+| Busy workers, average over the last 10 s of the run | 13.2 [12.7–13.5] | 13.1 [12.9–13.4] |
+
+**(b) Look for an idle tail.** With the normal error rates (the first table above), the last 10 seconds of the fair runs average 9.0 busy workers out of 16, against 12.5 first come, first served, and the fair runs have about 41 more idle worker-seconds in total. With errors off, the tails are the same (13.2 against 13.1).
+
+**What causes it.** The last job to finish in every fair run is the same request, `a-2341`, on its fifth attempt: with seed 42 the fake model fails it four times in a row, so its retries wait 1 + 2 + 4 + 8 seconds. Under fair scheduling the big tenant's requests are reached later (they share the window), so this request starts about 18 s before the end and its retry chain *is* the end of the run, with the other workers idle during its last backoff. Under first come, first served it starts about 22 s before the end and finishes about 4 s early, while the small tenants' requests keep the workers busy. Query used, on the database after the run:
+
+```sql
+-- For each run, request a-2341's attempts and when it finished/was queued relative to the run's end.
+WITH runs AS (
+  SELECT metadata->>'experiment' AS tag, max(completed_at) AS ended FROM batches
+  WHERE metadata->>'experiment' ~ '^(fair|fifo)-' GROUP BY 1 HAVING sum(request_total) = 3300)
+SELECT r.tag, j.attempt,
+       extract(epoch FROM r.ended - j.finalized_at) AS done_s_before_end,
+       extract(epoch FROM r.ended - j.created_at)  AS queued_s_before_end
+FROM runs r JOIN batches b ON b.metadata->>'experiment' = r.tag
+JOIN river_job j ON j.args->>'batch_id' = b.id AND j.args->>'custom_id' = 'a-2341';
+```
+
+which gave 5 attempts in all 10 runs, done 0.1–0.2 s before the end in the fair runs and 3.5–4.5 s before the end in the first-come runs.
+
+So the gap is a tail effect of one unlucky request's retry chain, not a slowdown while the batch is running: on average over the run, 13.1 against 13.5 workers are busy, and most of that difference is the tail. It would shrink as the big batch grows.
 
 ## Settings
 
