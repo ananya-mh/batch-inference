@@ -1,8 +1,10 @@
 # batch-inference
 
+[![CI](https://github.com/ananya-mh/batch-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/ananya-mh/batch-inference/actions/workflows/ci.yml)
+
 A multi-tenant batch inference service in Go. Upload a file of AI requests, and the service runs them in the background on a shared model and gives back a results file. It follows the [OpenAI Batch API](https://platform.openai.com/docs/guides/batch), so the official OpenAI SDKs work against it unchanged, and it can send work to any OpenAI-compatible model server (vLLM, Ollama, or a hosted provider). It is built to be fair across tenants, never lose work, never save a result twice, and survive crashes.
 
-**Status:** work in progress. Done: files, batches, workers, results files, cancel, expiry, and fair scheduling across tenants. Still to come: Prometheus metrics, CI, the full-size load test, and a run on a real GPU.
+**Status:** work in progress. Done: files, batches, workers, results files, cancel, expiry, fair scheduling across tenants, Prometheus metrics with a Grafana dashboard, and CI. Still to come: the full-size load test and a run on a real GPU.
 
 ## Run it
 
@@ -13,6 +15,8 @@ go test -race ./...                      # needs the Postgres from docker compos
 ```
 
 The fake model pretends to be an AI model, so no GPU is needed: it waits 50 to 500 ms per request, fails 2% of requests, and cuts off 1% of replies halfway, so retries are exercised all the time. Development tenants and API keys (`sk-dev-tenant-a` to `sk-dev-tenant-d`) are set in `compose.yaml`.
+
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push and pull request: gofmt, `go vet`, and `go test -race ./...` against a real Postgres (started with `max_connections=300`, as in `compose.yaml`); shellcheck on the scripts; and both crash tests (`scripts/crash-test.sh 500` and `--expiry 500`) against the full Docker Compose stack.
 
 ## Use it with the OpenAI SDK
 

@@ -1,0 +1,91 @@
+# Runs on every push and pull request: formatting, vet, the race-enabled
+# test suite against a real Postgres, a lint of the shell scripts, and both
+# crash tests against the full Docker Compose stack.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same branch cancels the run still going for the old one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go tests (race detector)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Started by hand rather than as a "service": service containers can't
+      # be given server flags, and the tests need max_connections=300, as in
+      # compose.yaml. Many test packages run at once, each test with its own
+      # database and a small pool, which is more than Postgres's default 100.
+      - name: Start Postgres with max_connections=300
+        run: |
+          docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres \
+            postgres:17 -c max_connections=300
+          # Wait for TCP: during its first start the image runs a temporary
+          # server on a socket only, then restarts.
+          for _ in $(seq 1 60); do
+            pg_isready -h localhost -p 5432 -U postgres && break
+            sleep 1
+          done
+          limit=$(docker exec postgres psql -U postgres -Atc "SHOW max_connections")
+          echo "max_connections = $limit"
+          test "$limit" = 300
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  scripts:
+    name: Shell scripts (shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
+
+  crash-tests:
+    name: Crash tests (docker compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds the image and runs the whole stack, so this also checks the
+      # Dockerfile and compose.yaml.
+      - name: Kill the server mid-batch and restart it
+        run: scripts/crash-test.sh 500
+
+      - name: Kill the server and keep it down past the batch's deadline
+        run: scripts/crash-test.sh --expiry 500
+
+      - name: Server logs (on failure)
+        if: failure()
+        run: docker compose logs --no-color server
