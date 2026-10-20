@@ -133,17 +133,13 @@ All on one machine. Apple M5 (10 cores), 16 GB RAM, macOS 26.6.2. Docker 29.7.2 
 
 ### Fairness experiment (noisy neighbor)
 
-Code at commit `9e56f02`, with the experiment script as committed in `1a2532e`; run on 2026-10-19.
-
-
 Tenant A submits one big batch; 5 seconds later tenants B, C and D each submit a small one. The same scenario runs with fair scheduling and with first come, first served, 5 times each, under identical conditions: same input files, same arrival timing, and the same fake model seed (so every request gets the same delay and the same errors in every run; the fake model is restarted before each run). Settings as in `compose.yaml`: 16 workers, a window of 32, fake model at 50–500 ms per request.
 
 ```sh
 scripts/fairness-experiment.sh                 # defaults: 3,000-request big batch, 3 x 100-request small ones
-BIG=50000 scripts/fairness-experiment.sh       # the full-size experiment (not yet run)
 ```
 
-A real run, `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0.02 CRASH_RATE=0.01 scripts/fairness-experiment.sh` (raw data: [per-run CSV, busy-worker samples, and chart](docs/results/fairness-2026-10-19-normal-rates/)):
+Commit `9274f49` (with `RIVER_FETCH_COOLDOWN` at its new 10 ms default), run on 2026-10-19. A real run, `RUNS=5 BIG=3000 SMALL=100 SMALL_DELAY=5 SEED=42 ERROR_RATE=0.02 CRASH_RATE=0.01 scripts/fairness-experiment.sh` (raw data: [per-run CSV, busy-worker samples, and chart](docs/results/fairness-2026-10-19-normal-rates/)):
 
 Tenant A: one batch of 3000 requests. Tenants B, C, D: one batch of 100 requests each, submitted 5s after A's.
 Fake model: 50–500 ms per request, error rate 0.02, cut-off-reply rate 0.01, seed 42. 16 workers, window of 32.
@@ -152,27 +148,27 @@ Every time is measured from that tenant's own submission (when its batch was cre
 
 | Metric | Fair scheduling | First come, first served |
 |---|---|---|
-| Small tenants: batch done, from its submission (slowest of B, C, D) | 9.17 [9.05–9.18] | 66.04 [65.23–66.07] |
-| Small tenants: wait from submission until a request's model call starts, p50 | 4.48 [4.47–4.49] | 61.56 [61.46–61.71] |
-| Small tenants: same wait, p99 | 8.61 [8.51–8.61] | 64.68 [64.53–64.73] |
-| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.07 [0.04–0.08] | 62.23 [62.17–62.32] |
-| Big tenant: batch done, from its submission | 73.52 [73.32–73.72] | 66.8 [66.65–66.82] |
-| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 44.9 [44.8–45] | 46.4 [46.4–47] |
-| Busy workers, average over the run (of 16) | 13.1 [13–13.1] | 13.5 [13.4–13.7] |
-| Idle worker-seconds over the run | 215 [213–218] | 174 [164–185] |
-| Busy workers, average over the last 10 s of the run | 9 [8.5–9.2] | 12.5 [12.1–13.1] |
+| Small tenants: batch done, from its submission (slowest of B, C, D) | 7.97 [7.92–7.98] | 56.47 [55.86–56.9] |
+| Small tenants: wait from submission until a request's model call starts, p50 | 3.95 [3.93–4] | 52.37 [52.33–52.41] |
+| Small tenants: same wait, p99 | 7.4 [7.36–7.41] | 55.08 [55.02–55.09] |
+| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.07 [0.01–0.08] | 53 [52.93–53.11] |
+| Big tenant: batch done, from its submission | 65.55 [65.36–66.15] | 59.91 [59.73–59.94] |
+| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 50.3 [49.9–50.5] | 53.7 [53.3–54.2] |
+| Busy workers, average over the run (of 16) | 14.7 [14.5–14.8] | 15.7 [15.6–15.9] |
+| Idle worker-seconds over the run | 87 [76–101] | 22 [8–24] |
+| Busy workers, average over the last 10 s of the run | 7.7 [6.8–8.4] | 14.2 [13.7–15.3] |
 
 Jobs retried per run (same seed, so this should match across runs): 92, 92, 92, 92, 92, 92, 92, 92, 92, 92.
 
 ```
 Median time from submission until done (seconds)
-small, fair      9.2  #####
-small, fifo     66.0  ####################################
-big,   fair     73.5  ########################################
-big,   fifo     66.8  ####################################
+small, fair      8.0  #####
+small, fifo     56.5  ##################################
+big,   fair     65.5  ########################################
+big,   fifo     59.9  ####################################
 ```
 
-What it shows: with fair scheduling the small tenants get their first slot within 0.1 s of submitting and finish about 9 s after submitting; first come, first served makes them wait about 62 s for the big batch to get out of the way. The cost is that the big batch finishes about 7 s (10%) later, since it shares the window. Total throughput is about 3% lower with fair scheduling in this run; the next section explains why.
+What it shows: with fair scheduling the small tenants get their first slot within 0.1 s of submitting and finish about 8 s after submitting; first come, first served makes them wait about 53 s for the big batch to get out of the way, about 7× longer. The cost is that the big batch finishes about 6 s (9%) later, since it shares the window, and total throughput is about 6% lower; the next section explains why. (With River's previous 100 ms fetch cooldown the same experiment gave 9.2 s against 66 s and a 3% throughput gap; everything is faster now because workers no longer wait for River's next fetch. That run is in the git history of `docs/results/`.)
 
 #### Investigating the throughput gap
 
@@ -182,19 +178,19 @@ The hypothesis: with fair scheduling the big tenant finishes last, so its final 
 
 | Metric | Fair scheduling | First come, first served |
 |---|---|---|
-| Small tenants: batch done, from its submission (slowest of B, C, D) | 8.84 [8.84–8.97] | 63.25 [63.24–63.26] |
-| Small tenants: wait from submission until a request's model call starts, p50 | 4.26 [4.26–4.32] | 59.6 [59.56–59.63] |
-| Small tenants: same wait, p99 | 8.29 [8.19–8.39] | 62.65 [62.59–62.66] |
-| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.03 [0.01–0.03] | 60.31 [60.18–60.37] |
-| Big tenant: batch done, from its submission | 68.31 [68.12–68.33] | 62.01 [61.95–62.03] |
-| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 48.3 [48.3–48.4] | 48.3 [48.3–48.3] |
-| Busy workers, average over the run (of 16) | 13.4 [13.3–13.5] | 13.5 [13.4–13.5] |
-| Idle worker-seconds over the run | 178 [167–181] | 172 [171–179] |
-| Busy workers, average over the last 10 s of the run | 13.2 [12.7–13.5] | 13.1 [12.9–13.4] |
+| Small tenants: batch done, from its submission (slowest of B, C, D) | 7.67 [7.62–7.75] | 53.85 [53.84–54.04] |
+| Small tenants: wait from submission until a request's model call starts, p50 | 3.73 [3.71–3.78] | 50.74 [50.69–50.8] |
+| Small tenants: same wait, p99 | 7.14 [7.13–7.18] | 53.28 [53.26–53.32] |
+| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.04 [0.03–0.05] | 51.36 [51.25–51.43] |
+| Big tenant: batch done, from its submission | 58.92 [58.92–59.14] | 53.57 [53.52–53.61] |
+| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 56 [55.8–56] | 56 [55.9–56] |
+| Busy workers, average over the run (of 16) | 15.7 [15.6–15.7] | 15.7 [15.6–15.7] |
+| Idle worker-seconds over the run | 20 [19–24] | 19 [18–21] |
+| Busy workers, average over the last 10 s of the run | 15.3 [15.2–15.5] | 15.5 [15.4–15.6] |
 
-**(b) Look for an idle tail.** With the normal error rates (the first table above), the last 10 seconds of the fair runs average 9.0 busy workers out of 16, against 12.5 first come, first served, and the fair runs have about 41 more idle worker-seconds in total. With errors off, the tails are the same (13.2 against 13.1).
+**(b) Look for an idle tail.** With the normal error rates (the first table above), the last 10 seconds of the fair runs average 7.7 busy workers out of 16, against 14.2 first come, first served, and the fair runs have about 65 more idle worker-seconds in total (87 against 22). With errors off, the tails are the same (15.3 against 15.5).
 
-**What causes it.** The last job to finish in every fair run is the same request, `a-2341`, on its fifth attempt: with seed 42 the fake model fails it four times in a row, so its retries wait 1 + 2 + 4 + 8 seconds. Under fair scheduling the big tenant's requests are reached later (they share the window), so this request starts about 18 s before the end and its retry chain *is* the end of the run, with the other workers idle during its last backoff. Under first come, first served it starts about 22 s before the end and finishes about 4 s early, while the small tenants' requests keep the workers busy. Query used, on the database after the run:
+**What causes it.** The last job to finish in every fair run is the same request, `a-2341`, on its fifth attempt: with seed 42 the fake model fails it four times in a row, so its retries wait 1 + 2 + 4 + 8 seconds. Under fair scheduling the big tenant's requests are reached later (they share the window), so this request starts about 18 s before the end and its retry chain *is* the end of the run, with the other workers idle during its last backoff. Under first come, first served it starts 18.8–19.8 s before the end and finishes 1.1–2.2 s early, while the small tenants' requests keep the workers busy. Query used, on the database after the run:
 
 ```sql
 -- For each run, request a-2341's attempts and when it finished/was queued relative to the run's end.
@@ -208,9 +204,9 @@ FROM runs r JOIN batches b ON b.metadata->>'experiment' = r.tag
 JOIN river_job j ON j.args->>'batch_id' = b.id AND j.args->>'custom_id' = 'a-2341';
 ```
 
-which gave 5 attempts in all 10 runs, done 0.1–0.2 s before the end in the fair runs and 3.5–4.5 s before the end in the first-come runs.
+which gave 5 attempts in all 10 runs, done 0.1–0.2 s before the end in the fair runs and 1.1–2.2 s before the end in the first-come runs.
 
-So the gap is a tail effect of one unlucky request's retry chain, not a slowdown while the batch is running: on average over the run, 13.1 against 13.5 workers are busy, and most of that difference is the tail. It would shrink as the big batch grows.
+So the gap is a tail effect of one unlucky request's retry chain, not a slowdown while the batch is running. Because that chain takes about the same 18 seconds however fast the rest goes, it is a bigger share of a faster run: the gap grew from 3% to 6% when the fetch cooldown change made runs shorter. It would shrink as the big batch grows.
 
 ### Throughput
 
@@ -227,11 +223,35 @@ How many requests per second the service itself can push through, with a near-in
 
 **What limits it.** With River's default settings throughput is about 160 requests/s, and it is River's fetch cooldown: River fetches new jobs at most once per `RIVER_FETCH_COOLDOWN` (100 ms by default, and River's own docs say "throughput is limited by this value"), taking at most as many jobs as there are free workers, so 16 workers can start at most 16 × 10 = 160 jobs a second. The table bears this out: halving the cooldown doubles throughput (157 → 311 requests/s), and at 100 ms only about 1.3 of 16 workers are busy, because they spend most of their time waiting for the next fetch. At 10 ms throughput reaches about 1,400 requests/s (the cooldown alone would allow 1,600), and from 1 ms other limits take over: a bigger window changes nothing, more workers help (64 workers reach about 3,300 requests/s with 37 busy), so what is left is the per-request work (the start check, the save, the scheduler) and CPU in the Docker VM.
 
-**Does it matter with a real model?** Less: 16 workers calling a model that takes 0.5 s can only do about 32 requests/s however fast River fetches. But a 100 ms cooldown also adds up to 100 ms of idle time before each worker's next job, which is probably part of why the fairness experiment (model at 50–500 ms, 0.275 s on average) reached about 45 requests/s rather than the 16 / 0.275 ≈ 58 that 16 workers could do (not measured separately). Lowering it (say to 10 ms) costs only more frequent, cheap fetch queries; the default is left at River's 100 ms for now, so the numbers above stay comparable.
+**Does it matter with a real model?** Less: 16 workers calling a model that takes 0.5 s can only do about 32 requests/s however fast River fetches. But a 100 ms cooldown also adds up to 100 ms of idle time before each worker's next job (about 50 ms on average), against a model call of 0.275 s on average in the fairness experiment. Rerunning that experiment with a 10 ms cooldown measured the difference: busy workers rose from 13.1 to 14.7 of 16 (fair) and 13.5 to 15.7 (first come), and throughput from 44.9 to 50.3 and 46.4 to 53.7 requests/s, close to the 16 / 0.275 ≈ 58 that 16 workers could do. Lowering it costs only more frequent, cheap fetch queries, so **the server's default is now 10 ms** (`RIVER_FETCH_COOLDOWN`); the fairness experiment above was rerun with it.
+
+### API load test
+
+Many clients polling batch status and listing batches while three tenants' batches of 2,000 requests run (compose.yaml's settings, so workers, the scheduler and finishing batches all share the database). k6 (`grafana/k6:2.2.0`) runs inside Docker's network; each simulated client polls a random tenant's batch status and lists its batches, pausing 0.1–0.5 s between rounds. Commit `15a795f`, run on 2026-10-19. The three tenants already had 67 to 106 earlier batches each from the experiments, which is what the list endpoint pages through.
+
+50 clients for 60 s, `VUS=50 DURATION=60s REQUESTS=2000 scripts/load-test.sh` ([raw data](docs/results/load-test-2026-10-19-50-clients/)):
+
+| Endpoint | Requests | Requests/s | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | Errors |
+|---|---|---|---|---|---|---|---|
+| `GET /v1/batches/{id}` (status) | 9920 | 164 | 0.4 | 0.6 | 1.3 | 87.3 | 0.00% |
+| `GET /v1/batches?limit=20` (list) | 9920 | 164 | 0.7 | 6.5 | 8.7 | 86.6 | 0.00% |
+
+Meanwhile the batches kept running: 3343 requests finished during the load; 3 of 3 batches were still in progress at the end.
+
+200 clients for 60 s, `VUS=200 DURATION=60s REQUESTS=2000 scripts/load-test.sh` ([raw data](docs/results/load-test-2026-10-19-200-clients/)):
+
+| Endpoint | Requests | Requests/s | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | Errors |
+|---|---|---|---|---|---|---|---|
+| `GET /v1/batches/{id}` (status) | 39593 | 655 | 0.5 | 1.2 | 8.7 | 48.6 | 0.00% |
+| `GET /v1/batches?limit=20` (list) | 39593 | 655 | 1.2 | 6.5 | 14.1 | 76.9 | 0.00% |
+
+Meanwhile the batches kept running: 3390 requests finished during the load; 3 of 3 batches were still in progress at the end.
+
+No errors at either load, and the batches kept the same pace. These latencies are lower than the status rows in the table below because k6 talks to the server inside Docker's network, while `scripts/measure.sh` uses curl from macOS through Docker's port forwarding, and those batches have 50,000 requests rather than 2,000.
 
 ### Other measurements
 
-Commit `d41e264`, run on 2026-10-19. Settings are compose.yaml's (16 workers, window of 32, fake model at 50–500 ms with 2% errors and 1% cut-off replies) unless a row says otherwise. The `status` rows use a near-instant fake model (1–5 ms, no errors) and `RIVER_FETCH_COOLDOWN=10ms` so 50,000-request batches finish in minutes; status latency and file writing depend on batch size, not model speed. Raw output: [`docs/results/measurements-2026-10-19/`](docs/results/measurements-2026-10-19/).
+Commit `d41e264`, run on 2026-10-19, when `RIVER_FETCH_COOLDOWN` still defaulted to River's 100 ms (it is now 10 ms). Settings are compose.yaml's (16 workers, window of 32, fake model at 50–500 ms with 2% errors and 1% cut-off replies) unless a row says otherwise. The `status` rows use a near-instant fake model (1–5 ms, no errors) and `RIVER_FETCH_COOLDOWN=10ms` so 50,000-request batches finish in minutes; status latency and file writing depend on batch size, not model speed. Raw output: [`docs/results/measurements-2026-10-19/`](docs/results/measurements-2026-10-19/).
 
 | Measurement | Result | Based on | Command |
 |---|---|---|---|
@@ -311,7 +331,7 @@ Server settings, read from environment variables (`compose.yaml` sets the develo
 | `JOB_TIMEOUT` | 2m | Longest one model call may take |
 | `RESCUE_STUCK_JOBS_AFTER` | 5m | How long a job may stay running before River assumes its worker died and runs it again; must be longer than `JOB_TIMEOUT` |
 | `SCHEDULER_INTERVAL` | 200ms | How often the scheduler runs when no finished request nudges it sooner |
-| `RIVER_FETCH_COOLDOWN` | 100ms | Shortest time between River's fetches of new jobs; caps throughput at about `WORKERS` / cooldown (see [Throughput](#throughput)) |
+| `RIVER_FETCH_COOLDOWN` | 10ms | Shortest time between River's fetches of new jobs; caps throughput at about `WORKERS` / cooldown (see [Throughput](#throughput)). River's own default is 100 ms |
 | `RIVER_FETCH_POLL_INTERVAL` | 1s | How often River looks for jobs when it hears of none |
 | `COMPLETION_WINDOWS` | `24h` | Allowed completion windows (tests add short ones like `10s`) |
 | `MAX_UPLOAD_BYTES` | 104857600 | Upload size limit (100 MB) |

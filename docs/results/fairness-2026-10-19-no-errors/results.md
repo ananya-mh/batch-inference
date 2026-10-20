@@ -9,22 +9,22 @@ Every time is measured from that tenant's own submission (when its batch was cre
 
 | Metric | Fair scheduling | First come, first served |
 |---|---|---|
-| Small tenants: batch done, from its submission (slowest of B, C, D) | 8.84 [8.84–8.97] | 63.25 [63.24–63.26] |
-| Small tenants: wait from submission until a request's model call starts, p50 | 4.26 [4.26–4.32] | 59.6 [59.56–59.63] |
-| Small tenants: same wait, p99 | 8.29 [8.19–8.39] | 62.65 [62.59–62.66] |
-| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.03 [0.01–0.03] | 60.31 [60.18–60.37] |
-| Big tenant: batch done, from its submission | 68.31 [68.12–68.33] | 62.01 [61.95–62.03] |
-| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 48.3 [48.3–48.4] | 48.3 [48.3–48.3] |
-| Busy workers, average over the run (of 16) | 13.4 [13.3–13.5] | 13.5 [13.4–13.5] |
-| Idle worker-seconds over the run | 178 [167–181] | 172 [171–179] |
-| Busy workers, average over the last 10 s of the run | 13.2 [12.7–13.5] | 13.1 [12.9–13.4] |
+| Small tenants: batch done, from its submission (slowest of B, C, D) | 7.67 [7.62–7.75] | 53.85 [53.84–54.04] |
+| Small tenants: wait from submission until a request's model call starts, p50 | 3.73 [3.71–3.78] | 50.74 [50.69–50.8] |
+| Small tenants: same wait, p99 | 7.14 [7.13–7.18] | 53.28 [53.26–53.32] |
+| Small tenants: wait from submission until the first request gets a slot (slowest) | 0.04 [0.03–0.05] | 51.36 [51.25–51.43] |
+| Big tenant: batch done, from its submission | 58.92 [58.92–59.14] | 53.57 [53.52–53.61] |
+| Total throughput: all requests / (last batch done − first batch submitted), requests/s | 56 [55.8–56] | 56 [55.9–56] |
+| Busy workers, average over the run (of 16) | 15.7 [15.6–15.7] | 15.7 [15.6–15.7] |
+| Idle worker-seconds over the run | 20 [19–24] | 19 [18–21] |
+| Busy workers, average over the last 10 s of the run | 15.3 [15.2–15.5] | 15.5 [15.4–15.6] |
 
 Jobs retried per run (same seed, so this should match across runs): 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.
 
 ```
 Median time from submission until done (seconds)
-small, fair      8.8  #####
-small, fifo     63.2  #####################################
-big,   fair     68.3  ########################################
-big,   fifo     62.0  ####################################
+small, fair      7.7  #####
+small, fifo     53.9  ####################################
+big,   fair     58.9  ########################################
+big,   fifo     53.6  ####################################
 ```
