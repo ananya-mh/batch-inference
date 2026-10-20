@@ -52,7 +52,7 @@ type Config struct {
 	// FetchCooldown is the shortest time between two fetches of new jobs by
 	// River. Each fetch takes at most as many jobs as there are free
 	// workers, so this caps throughput at about Workers / FetchCooldown.
-	// Zero means River's default (100 ms).
+	// Zero means River's default (100 ms); the server's default is 10 ms.
 	FetchCooldown time.Duration
 
 	// FetchPollInterval is how often River looks for jobs when it hears of

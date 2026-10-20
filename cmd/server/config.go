@@ -70,9 +70,11 @@ func readConfig() (config, error) {
 		return config{}, err
 	}
 	cfg.worker.RetryBaseDelay = time.Second
-	// River's own defaults; see "Throughput" in the README for what changing
-	// them does.
-	if cfg.worker.FetchCooldown, err = envDuration("RIVER_FETCH_COOLDOWN", 100*time.Millisecond); err != nil {
+	// 10 ms rather than River's 100 ms: River fetches at most once per
+	// cooldown, so 100 ms capped 16 workers at about 160 jobs a second and
+	// left workers idle between jobs (see "Throughput" in the README). The
+	// poll interval stays at River's 1 s.
+	if cfg.worker.FetchCooldown, err = envDuration("RIVER_FETCH_COOLDOWN", 10*time.Millisecond); err != nil {
 		return config{}, err
 	}
 	if cfg.worker.FetchPollInterval, err = envDuration("RIVER_FETCH_POLL_INTERVAL", time.Second); err != nil {
